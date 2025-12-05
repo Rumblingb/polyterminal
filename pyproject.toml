@@ -1,0 +1,11 @@
+[project]
+name = "polyterminal"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "eth-account>=0.13.7",
+    "py-clob-client>=0.28.0",
+    "web3>=7.14.0",
+]
