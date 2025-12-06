@@ -72,6 +72,7 @@ class Recorder:
         self.session: Optional[aiohttp.ClientSession] = None
         self.db_enabled = False
         self.stats = {"snapshots": 0, "markets": 0, "errors": 0}
+        self.pending_resolution: list[Market] = []
 
     # =========================================================================
     # database
@@ -196,6 +197,49 @@ class Recorder:
         except Exception as e:
             log.error(f"resolution update error: {e}")
 
+    async def resolve_from_db(self):
+        """resolve unresolved markets from DB (handles redeployments)"""
+        headers = self._db_headers()
+        now = int(time.time())
+
+        try:
+            # get unresolved markets where window ended
+            async with self.session.get(
+                f"{SUPABASE_URL}/rest/v1/markets?outcome=is.null&select=id,coin,window_ts,slug,spot_start",
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    return
+                markets = await resp.json()
+
+            for m in markets:
+                end_ts = m["window_ts"] + 900
+                if now <= end_ts:
+                    continue  # still active
+
+                # get last snapshot for spot_end
+                async with self.session.get(
+                    f"{SUPABASE_URL}/rest/v1/snapshots?market_id=eq.{m['id']}&select=spot_price&order=ts.desc&limit=1",
+                    headers=headers
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    snaps = await resp.json()
+
+                if not snaps or snaps[0]["spot_price"] == 0:
+                    continue
+
+                spot_start = m.get("spot_start") or 0
+                spot_end = snaps[0]["spot_price"]
+                if spot_start == 0:
+                    continue
+
+                outcome = "UP" if spot_end >= spot_start else "DOWN"
+                await self.update_resolution(m["id"], outcome, spot_start, spot_end)
+
+        except Exception as e:
+            log.error(f"resolve_from_db error: {e}")
+
     # =========================================================================
     # market discovery
     # =========================================================================
@@ -241,6 +285,10 @@ class Recorder:
 
             # check if new market
             if coin not in self.markets or self.markets[coin].window_ts != window_ts:
+                # save old market for resolution before replacing
+                if coin in self.markets and self.markets[coin].db_id:
+                    self.pending_resolution.append(self.markets[coin])
+
                 spot_start = await self.fetch_spot_start(coin, window_ts)
                 market = Market(
                     coin=coin,
@@ -387,23 +435,34 @@ class Recorder:
         while True:
             await asyncio.sleep(30)  # check every 30s
 
-            # find markets that should be resolved (window ended)
-            now = int(time.time())
-            for coin, market in list(self.markets.items()):
-                end_ts = market.window_ts + 900
-                if now > end_ts and not market.resolved and market.db_id:
-                    # fetch outcome from gamma
-                    outcome = await self.fetch_outcome(market.slug)
-                    if outcome:
-                        spot_end = self.spot_prices.get(coin, 0)
-                        await self.update_resolution(
-                            market.db_id,
-                            outcome,
-                            market.spot_start or 0,
-                            spot_end
-                        )
-                        market.resolved = True
-                        log.info(f"[{coin.upper()}] resolved: {outcome}")
+            # also check DB for unresolved markets (handles redeployments)
+            if self.db_enabled:
+                await self.resolve_from_db()
+
+            # process pending resolution list
+            resolved = []
+            for market in self.pending_resolution:
+                if market.resolved:
+                    resolved.append(market)
+                    continue
+
+                outcome = await self.fetch_outcome(market.slug)
+                if outcome:
+                    spot_end = self.spot_prices.get(market.coin, 0)
+                    await self.update_resolution(
+                        market.db_id,
+                        outcome,
+                        market.spot_start or 0,
+                        spot_end
+                    )
+                    market.resolved = True
+                    resolved.append(market)
+                    log.info(f"[{market.coin.upper()}] resolved: {outcome}")
+
+            # remove resolved markets from pending list
+            for m in resolved:
+                if m in self.pending_resolution:
+                    self.pending_resolution.remove(m)
 
     async def fetch_outcome(self, slug: str) -> Optional[str]:
         """fetch resolution from gamma API"""
