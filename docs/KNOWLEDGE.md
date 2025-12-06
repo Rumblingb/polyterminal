@@ -222,3 +222,31 @@ dependencies = [
 ```
 
 Run with: `uv run python bot.py`
+
+## Real Window Examples
+
+### Late Reversal (observed live)
+```
+Window: btc-updown-15m-1764911700 (05:15 UTC)
+Start BTC: ~$99,800
+
+Timeline:
+- 05:17 (+2min): BTC +0.04%, UP at 0.65
+- 05:21 (+6min): BTC -0.11%, UP crashes to 0.03
+- 05:25 (+10min): BTC starts recovering
+- 05:27 (+12min): BTC +0.045%, UP at 0.90
+- 05:30 (end): UP WINS despite being at 0.03 with 9 min left
+
+Key insight: BTC moved from -0.11% to +0.045% in ~2.4 minutes.
+That's a 0.155% move - enough to flip the outcome.
+Never assume "nearly certain" with >3 min left.
+```
+
+### MM Response Observation
+```
+When BTC dropped -0.35% suddenly:
+- Poly prices took 3-6 seconds to update
+- During that window, old 0.49/0.51 quotes still showed
+- REST polling caught the real 0.03/0.04 prices
+- WebSocket was completely stale (showed wrong prices)
+```
