@@ -202,14 +202,12 @@ def check_signal(self):
 ## File Structure
 ```
 polyterminal/
-├── bot.py              # main paper trading bot
-├── backtest.py         # historical backtest
-├── btc_eth_corr.py     # cross-asset correlation analysis
-├── hft_momentum.py     # momentum scalping backtest
-├── zero_assumptions.py # empirical analysis, no assumptions
-├── tick_recorder.py    # record tick data to JSON
-├── time_analysis.py    # time-based pattern analysis
-└── data/               # saved tick data, analysis results
+├── main.py             # always-on data recorder (500ms polling)
+├── recorder.py         # simpler recorder variant
+├── schema.sql          # supabase schema for markets + snapshots
+└── docs/
+    ├── KNOWLEDGE.md    # this file
+    └── polymarket/     # api documentation
 ```
 
 ## Dependencies
@@ -221,7 +219,32 @@ dependencies = [
 ]
 ```
 
-Run with: `uv run python bot.py`
+Run recorder: `uv run python main.py`
+
+## Data Recorder
+
+### main.py Architecture
+```python
+async def run(self):
+    await asyncio.gather(
+        self.binance_ws(),   # real-time BTC/ETH/SOL/XRP prices
+        self.poll_loop(),    # 500ms CLOB /book polling
+        self.reporter(),     # status every 10s
+    )
+```
+
+### What Gets Recorded
+- **markets table**: coin, window_ts, slug, up_token, down_token, outcome
+- **snapshots table**: ts, spot_price, up_bid/ask, down_bid/ask, up_depth, down_depth
+
+### Rate Limits
+- CLOB /book: 200 req/10s (20/sec) - safe for 500ms polling of 8 tokens
+- Gamma /events: 100 req/10s - only called every 30s for market discovery
+
+### Deployment
+1. Set SUPABASE_URL and SUPABASE_KEY env vars
+2. Run schema.sql in Supabase SQL editor
+3. Deploy to Railway/Fly.io
 
 ## Real Window Examples
 
