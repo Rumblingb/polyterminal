@@ -12,8 +12,11 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
+from dotenv import load_dotenv
 import aiohttp
 import websockets
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +48,8 @@ class Market:
     up_token: str
     down_token: str
     db_id: Optional[int] = None
+    spot_start: Optional[float] = None
+    resolved: bool = False
 
 
 @dataclass
@@ -125,6 +130,7 @@ class Recorder:
             "slug": market.slug,
             "up_token": market.up_token,
             "down_token": market.down_token,
+            "spot_start": market.spot_start,
         }
         try:
             async with self.session.post(
@@ -235,16 +241,18 @@ class Recorder:
 
             # check if new market
             if coin not in self.markets or self.markets[coin].window_ts != window_ts:
+                spot_start = await self.fetch_spot_start(coin, window_ts)
                 market = Market(
                     coin=coin,
                     window_ts=window_ts,
                     slug=slug,
                     up_token=tokens[0],
                     down_token=tokens[1],
+                    spot_start=spot_start,
                 )
                 market.db_id = await self.get_or_create_market(market)
                 self.markets[coin] = market
-                log.info(f"[{coin.upper()}] new window: {slug} (db_id={market.db_id})")
+                log.info(f"[{coin.upper()}] new window: {slug} spot_start=${spot_start:,.2f} (db_id={market.db_id})")
 
     # =========================================================================
     # order book fetching
@@ -269,26 +277,46 @@ class Recorder:
             return 0, 1, {}
 
     # =========================================================================
-    # binance websocket
+    # binance price fetching (REST - more reliable than WS on cloud)
     # =========================================================================
 
+    async def fetch_spot_start(self, coin: str, window_ts: int) -> Optional[float]:
+        """fetch binance kline open price at window start"""
+        symbol = f"{coin.upper()}USDT"
+        start_ms = window_ts * 1000
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&startTime={start_ms}&limit=1"
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data:
+                        return float(data[0][1])  # open price
+        except Exception as e:
+            log.error(f"binance kline error: {e}")
+        return None
+
     async def binance_ws(self):
-        streams = "/".join([f"{c}usdt@trade" for c in COINS])
-        url = f"{BINANCE_WS}/{streams}"
+        """stream real-time prices from binance websocket"""
+        streams = "/".join(f"{coin}usdt@trade" for coin in COINS)
+        url = f"wss://stream.binance.com:9443/stream?streams={streams}"
 
         while True:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=20) as ws:
                     log.info("binance ws connected")
                     async for msg in ws:
                         data = json.loads(msg)
-                        symbol = data.get("s", "").lower().replace("usdt", "")
-                        price = float(data.get("p", 0))
-                        if symbol in COINS:
-                            self.spot_prices[symbol] = price
+                        if "data" in data:
+                            trade = data["data"]
+                            symbol = trade.get("s", "").lower()
+                            price = float(trade.get("p", 0))
+                            for coin in COINS:
+                                if symbol == f"{coin}usdt":
+                                    self.spot_prices[coin] = price
+                                    break
             except Exception as e:
                 log.error(f"binance ws error: {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
 
     # =========================================================================
     # main loops
@@ -352,6 +380,58 @@ class Recorder:
             sleep_time = max(0, POLL_INTERVAL - elapsed)
             await asyncio.sleep(sleep_time)
 
+    async def resolution_checker(self):
+        """poll for closed markets and update outcomes"""
+        await asyncio.sleep(60)  # wait for initial markets
+
+        while True:
+            await asyncio.sleep(30)  # check every 30s
+
+            # find markets that should be resolved (window ended)
+            now = int(time.time())
+            for coin, market in list(self.markets.items()):
+                end_ts = market.window_ts + 900
+                if now > end_ts and not market.resolved and market.db_id:
+                    # fetch outcome from gamma
+                    outcome = await self.fetch_outcome(market.slug)
+                    if outcome:
+                        spot_end = self.spot_prices.get(coin, 0)
+                        await self.update_resolution(
+                            market.db_id,
+                            outcome,
+                            market.spot_start or 0,
+                            spot_end
+                        )
+                        market.resolved = True
+                        log.info(f"[{coin.upper()}] resolved: {outcome}")
+
+    async def fetch_outcome(self, slug: str) -> Optional[str]:
+        """fetch resolution from gamma API"""
+        url = f"{GAMMA_API}/events/slug/{slug}"
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                event = await resp.json()
+                markets = event.get("markets", [])
+                if not markets:
+                    return None
+                m = markets[0]
+                if not m.get("closed"):
+                    return None
+                prices = m.get("outcomePrices", "[]")
+                if isinstance(prices, str):
+                    prices = json.loads(prices)
+                if len(prices) >= 2:
+                    # prices[0]=UP, prices[1]=DOWN - winner has price=1
+                    if prices[0] == "1":
+                        return "UP"
+                    elif prices[1] == "1":
+                        return "DOWN"
+        except Exception as e:
+            log.error(f"outcome fetch error: {e}")
+        return None
+
     async def reporter(self):
         await asyncio.sleep(5)
 
@@ -387,6 +467,7 @@ class Recorder:
                 self.binance_ws(),
                 self.poll_loop(),
                 self.reporter(),
+                self.resolution_checker(),
             )
         except KeyboardInterrupt:
             log.info("shutting down...")
