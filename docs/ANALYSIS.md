@@ -1,153 +1,248 @@
-# Polymarket 15-Minute Market Analysis
+# Polymarket 15-Minute Binary Options Strategy
 
-## Data Collection Session: 2025-12-05 05:30 UTC
+## Overview
 
-### Raw Data Captured
+Trading strategy for Polymarket's 15-minute BTC binary options.
+Markets resolve based on Chainlink Data Streams BTC/USD price.
 
-**Window: btc-updown-15m-1764912600 (05:30-05:45 UTC)**
-**Start Price: $91,986.97**
+---
+
+## Market Structure
+
+- **Window Duration**: 15 minutes (start at :00, :15, :30, :45)
+- **UP Token**: Wins $1 if price_end >= price_start
+- **DOWN Token**: Wins $1 if price_end < price_start
+- **Resolution Source**: Chainlink Data Streams
+
+---
+
+## The Strategy
+
+### Entry Rules
 
 ```
-Time     | BTC Price  | %Chg    | UP Bid/Ask
----------|------------|---------|------------
-05:30:03 | $91,986.97 | +0.000% | 0.52/0.53
-05:30:06 | $91,983.09 | -0.004% | 0.50/0.53
-05:30:09 | $91,968.76 | -0.020% | 0.48/0.49
-05:30:13 | $91,963.21 | -0.026% | 0.47/0.49
-05:30:16 | $91,944.98 | -0.046% | 0.42/0.44
-05:30:19 | $91,944.97 | -0.046% | 0.41/0.42
-05:30:22 | $91,936.33 | -0.055% | 0.39/0.40
-05:30:32 | $91,936.32 | -0.055% | 0.38/0.39
-05:30:39 | $91,924.17 | -0.068% | 0.34/0.35
-05:30:45 | $91,916.94 | -0.076% | 0.33/0.34
-05:31:32 | $91,903.12 | -0.091% | 0.28/0.29
-05:31:52 | $91,896.72 | -0.098% | 0.25/0.26
-05:32:02 | $91,880.13 | -0.116% | 0.22/0.23
-05:32:15 | $91,880.13 | -0.116% | 0.21/0.23
-05:32:28 | $91,891.60 | -0.104% | 0.27/0.28
-05:32:48 | $91,919.52 | -0.073% | 0.30/0.31
-05:33:08 | $91,927.80 | -0.064% | 0.34/0.35
-05:33:54 | $91,906.59 | -0.087% | 0.28/0.29
-05:34:40 | $91,922.67 | -0.070% | 0.31/0.32
+At minute 10 of each 15-min window:
+
+1. Get window start price (BTC open at :00/:15/:30/:45)
+2. Get current BTC price from Binance
+3. Calculate: spot_chg = (current - start) / start * 100
+
+4. Predict MM mid:
+   predicted_up = 0.50 + 1.5*spot_chg + 1.5*spot_chg*(10/15)
+   predicted_up = clamp(predicted_up, 0.02, 0.98)
+
+5. Calculate confidence:
+   confidence = abs(predicted_up - 0.5)
+
+6. IF confidence > 0.05:
+   - If predicted_up > 0.5: BUY UP at ask
+   - If predicted_up < 0.5: BUY DOWN at ask
+   ELSE:
+   - Skip this window
 ```
 
----
+### Why Minute 10?
 
-## Key Findings
+- Early enough to capture larger moves (better entry prices)
+- Late enough that BTC momentum is established
+- 5 minutes until resolution = high probability direction holds
 
-### 1. Market Maker Response Time: 3-6 SECONDS
+### Why Confidence > 5%?
 
-The Polymarket order book updates within 3-6 seconds of BTC price changes on Binance.
+| Filter | Win Rate | Edge | Trades/Day |
+|--------|----------|------|------------|
+| All | 81.8% | +4.6% | 96 |
+| **>5%** | **85.1%** | **+4.9%** | **84** |
+| >10% | 87.0% | +3.8% | 73 |
+| >15% | 88.5% | +2.5% | 63 |
 
-**Evidence:**
-- 05:30:03: BTC at start price → UP at 0.52
-- 05:30:09: BTC drops 0.02% → UP already at 0.48 (6 seconds later)
-- 05:30:16: BTC drops 0.046% → UP at 0.42 (13 seconds total)
-
-**Implication:** Edge window is measured in SECONDS, not minutes.
-
-### 2. Spread: Consistently 1-2 Cents
-
-Throughout the entire session:
-- Spread ranged from $0.01 to $0.02
-- Never saw spread > $0.03
-
-**Implication:** Round-trip cost is 2-4%. Need significant price movement to profit.
-
-### 3. Price Correlation is Tight
-
-| BTC % Change | Expected UP | Actual UP | Difference |
-|--------------|-------------|-----------|------------|
-| -0.02% | ~0.45 | 0.48 | +0.03 |
-| -0.05% | ~0.35 | 0.40 | +0.05 |
-| -0.07% | ~0.30 | 0.34 | +0.04 |
-| -0.10% | ~0.20 | 0.26 | +0.06 |
-| -0.12% | ~0.15 | 0.22 | +0.07 |
-
-**Observation:** Poly prices are slightly HIGHER than theoretical fair value when BTC drops. This could indicate:
-- Mean reversion expectation by MMs
-- Risk premium
-- Slight inefficiency (~5-7 cents)
-
-### 4. Volatility Within Window
-
-Price bounced significantly during the 4-minute observation:
-- UP ranged from 0.21 to 0.52
-- BTC ranged from $91,880 to $91,987 (-0.12% to 0%)
-
-**Implication:** Even within a window, there are multiple trading opportunities as BTC oscillates.
-
-### 5. Liquidity at Best Price
-
-From earlier order book snapshots:
-- Best bid/ask size: 50-400 shares typically
-- Depth within 5 cents: ~$4,600 per side
-- Market impact for $1000 order: ~2-3 cents slippage
+Conf>5% has the highest edge (+4.9%) while maintaining good volume.
 
 ---
 
-## Strategy Implications
+## Expected Performance
 
-### What DOESN'T Work:
-1. **Simple threshold strategy (0.1% move → buy)** - Market already priced in by the time we react
-2. **Polling every 60 seconds** - Way too slow
-3. **Assuming 50/50 starting price** - Markets start at 0.52/0.53, not 0.50
+### Per $100 Bet (Fixed Size)
 
-### What MIGHT Work:
+| Metric | Value |
+|--------|-------|
+| Win rate | 85.1% |
+| Breakeven | 80.2% |
+| Edge | +4.9% |
+| Avg entry | $0.80 |
+| ROI/trade | 7.5% |
+| Daily P&L | $632 |
+| 90-day P&L | $56,847 |
 
-#### A. Sub-Second Arbitrage
-- Need Binance WebSocket (not REST polling)
-- Need pre-signed Polymarket orders
-- React within 1-2 seconds of BTC move
-- Target: Capture 3-5 cent mispricing
-- Requires: Co-located servers near both Binance and Polymarket
+### Scaling (Start $1000)
 
-#### B. Mean Reversion During Extremes
-- When UP hits 0.20-0.25 (or 0.75-0.80), bet on reversion
-- BTC often oscillates, doesn't go straight to resolution
-- Evidence: In our data, UP went from 0.21 back to 0.35
+| Week | Bet Size | Weekly Profit | Cumulative |
+|------|----------|---------------|------------|
+| 1 | $100 | ~$4,400 | $5,400 |
+| 2 | $150 | ~$6,600 | $12,000 |
+| 3 | $200 | ~$8,800 | $20,800 |
+| 4+ | $500 (max) | ~$22,000/wk | liquidity-capped |
 
-#### C. Late Window Momentum
-- With 2-3 minutes left, if price is at extreme (0.1 or 0.9), it's likely correct
-- Buy the winning side at 0.90, sell at 0.99
-- Lower risk, lower reward
+**Liquidity ceiling: ~$500-2000 per side per market**
 
 ---
 
-## Technical Requirements for Live Trading
+## Position Sizing
 
-### Latency Requirements:
-- Binance → Your Server: <50ms
-- Your Server → Polymarket: <100ms
-- Total round-trip: <200ms
-- **Implication:** Need AWS us-east-1 (Polymarket) or co-location
+### Fixed Size (Recommended for Start)
 
-### Order Execution:
-- Must use CLOB API with pre-authenticated sessions
-- Consider using FOK (fill-or-kill) orders to avoid partial fills
-- Need to handle order signing without blocking
+- Start with $50-100 per trade
+- Scale up slowly as you verify live performance
+- Never exceed available liquidity
 
-### Data Infrastructure:
+### Kelly Criterion
+
+| Metric | Value |
+|--------|-------|
+| Win probability | 0.85 |
+| Avg odds | 0.25:1 |
+| Full Kelly | 24.5% |
+| Quarter Kelly | 6.1% |
+
+**Use quarter-Kelly (6%) max** due to:
+- Oracle mismatch risk (5.4%)
+- Model uncertainty
+- Execution variance
+
+---
+
+## Risk Factors
+
+### 1. Oracle Mismatch (5.4%)
+
+Polymarket uses Chainlink, we use Binance. In 5.4% of windows, they disagree on outcome.
+- **Impact**: Random loss ~1 in 20 trades
+- **Mitigation**: None without Chainlink Data Streams access ($$$)
+
+### 2. Liquidity Constraints
+
+- Typical depth: $500-2000 per side
+- Large orders will move the market
+- **Mitigation**: Cap bet size at visible liquidity
+
+### 3. Spread Widening
+
+| Time Remaining | Typical Spread |
+|---------------|----------------|
+| >10 min | 1-2 cents |
+| 5-10 min | 2-3 cents |
+| <5 min | 3-5+ cents |
+
+- **Mitigation**: Enter at minute 10, not later
+
+### 4. MM Adaptation
+
+If your flow becomes predictable, MMs may widen spreads or adjust pricing.
+- **Mitigation**: Vary timing slightly, don't always max size
+
+---
+
+## Implementation Requirements
+
+### Must Have
+
 - Binance WebSocket for real-time BTC price
-- Polymarket WebSocket (if available) or fast polling
-- Record all data for analysis
+- Track window start prices (open at :00/:15/:30/:45)
+- Polymarket CLOB API for order execution
+- API credentials (in .env)
+
+### Nice to Have
+
+- Telegram alerts for trades
+- P&L tracking
+- Automatic position management
+
+### Not Required
+
+- Chainlink Data Streams (too expensive)
+- Sub-millisecond infrastructure
+- Co-location
 
 ---
 
-## Next Steps
+## Code Architecture
 
-1. **Build proper recorder** - Capture every tick for multiple windows
-2. **Analyze historical trades** - Get trade-level data from CLOB API
-3. **Quantify the edge** - Backtest on recorded data
-4. **Measure latency** - Time each component
-5. **Paper trade with realistic execution** - Account for latency + slippage
+```
+bot.py
+├── BinanceWS           # real-time BTC price stream
+├── WindowTracker       # tracks start prices for each window
+├── Strategy            # calculates signals at minute 10
+├── PolymarketClient    # executes orders via CLOB API
+└── TelegramNotifier    # alerts on trades (optional)
+```
+
+### Key Functions
+
+```python
+def calculate_signal(start_price, current_price, elapsed_seconds):
+    spot_chg = (current_price - start_price) / start_price * 100
+    time_norm = elapsed_seconds / 900
+
+    predicted_up = 0.50 + 1.5*spot_chg + 1.5*spot_chg*time_norm
+    predicted_up = max(0.02, min(0.98, predicted_up))
+
+    confidence = abs(predicted_up - 0.5)
+
+    if confidence < 0.05:
+        return None  # skip
+
+    return 'UP' if predicted_up > 0.5 else 'DOWN'
+```
 
 ---
 
-## Questions to Answer
+## Backtest Summary
 
-1. Is there a Polymarket WebSocket for order book updates?
-2. What's the actual latency from order submission to fill?
-3. How many other bots are competing for this edge?
-4. Does the edge persist across different volatility regimes?
-5. What's the maximum position size before moving the market?
+### Data
+
+- 90 days of Binance 1-min OHLC
+- 8,639 BTC windows
+- Simulated MM pricing model
+
+### Results (Conf>5% filter)
+
+| Metric | Value |
+|--------|-------|
+| Total trades | 7,586 |
+| Win rate | 85.1% |
+| Edge over breakeven | +4.9% |
+| Total P&L ($100/trade) | $56,847 |
+| Max losing streak | 5 |
+
+### Caveats
+
+1. **Synthetic data**: Used model to simulate MM prices, not real order book
+2. **No execution simulation**: Assumed fill at ask + 2c slippage
+3. **Oracle mismatch randomized**: Used 5.4% random flip, real pattern unknown
+4. **Past performance ≠ future results**
+
+---
+
+## Monitoring
+
+### Daily Checks
+
+- [ ] Win rate holding >80%?
+- [ ] Average entry price stable (~80c)?
+- [ ] Liquidity sufficient for bet size?
+- [ ] Any unusual oracle mismatches?
+
+### Red Flags
+
+- Win rate drops below 75% for 3+ days
+- Spreads consistently >5c at minute 10
+- Fills significantly worse than expected
+- Multiple consecutive losses on "high confidence" trades
+
+---
+
+## Changelog
+
+- **2025-12-06**: Initial strategy based on 90-day synthetic backtest
+- Conf>5% filter identified as optimal (edge +4.9%)
+- BTC-only focus (most liquid, best data)

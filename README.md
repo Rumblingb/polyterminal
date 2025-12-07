@@ -123,13 +123,6 @@ web: python main.py
 - CLOB /book: 200 req/10s (safe at 500ms polling)
 - Gamma /events: 100 req/10s (only called every 30s)
 
-## Observed Market Behavior
-
-- MM response time: 3-6 seconds after BTC move
-- Spread: 1-3 cents typical
-- Late window (last 3 min): prices converge toward 0 or 1
-- Spread widens significantly in last minute
-
 ## Price Correlation
 
 | BTC move | Typical UP price |
