@@ -4,6 +4,9 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import dynamic from 'next/dynamic'
 
 const PriceChart = dynamic(() => import('./components/PriceChart'), { ssr: false })
+const HistoricalEdgeChart = dynamic(() => import('./components/HistoricalEdgeChart'), { ssr: false })
+import DepthVisualization from './components/DepthVisualization'
+import PositionSimulator from './components/PositionSimulator'
 import WindowTracker from './components/WindowTracker'
 
 const CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
@@ -68,14 +71,16 @@ export default function Dashboard() {
   const [markets, setMarkets] = useState<Market[]>([])
   const [prices, setPrices] = useState<Prices>({})
   const [status, setStatus] = useState<'connecting' | 'live' | 'error'>('connecting')
+  const [clobReady, setClobReady] = useState(false)
   const [progress, setProgress] = useState(0)
   const [selectedCoin, setSelectedCoin] = useState<string | null>(null)
-  const [alertThreshold, setAlertThreshold] = useState(0.995)
+  const [alertThreshold, setAlertThreshold] = useState(0.98)
 
   // edge tracking
   const [edgeHistory, setEdgeHistory] = useState<Record<string, EdgePoint[]>>({})
   const [alerts, setAlerts] = useState<ArbAlert[]>([])
   const [targetPrices, setTargetPrices] = useState<Record<string, number | null>>({})
+  const [viewingWindowTs, setViewingWindowTs] = useState<number | null>(null)
   const lastEdgeUpdateRef = useRef<Record<string, number>>({})
 
   const clobWsRef = useRef<WebSocket | null>(null)
@@ -107,42 +112,49 @@ export default function Dashboard() {
       const res = await fetch('/api/markets')
       const data = await res.json()
 
-      const newMarkets: Market[] = []
       const newTokenMap = new Map<string, { coin: string; side: 'up' | 'down' }>()
 
-      for (const m of data) {
-        newMarkets.push({
-          coin: m.coin,
-          windowTs: m.windowTs,
-          windowStart: m.windowStart,
-          windowEnd: m.windowEnd,
-          upToken: m.upToken,
-          downToken: m.downToken,
-          upBid: 0,
-          upAsk: m.upPrice || 1,
-          downBid: 0,
-          downAsk: m.downPrice || 1,
-          upBook: { bids: [], asks: [] },
-          downBook: { bids: [], asks: [] },
-          volume: m.volume || 0,
-          liquidity: m.liquidity || 0,
-          title: m.title || '',
-          conditionId: m.conditionId || '',
-          slug: m.slug || '',
-          spread: m.spread,
-          competitive: m.competitive || 0,
-        })
+      // preserve existing bid/ask values when refreshing
+      setMarkets(prev => {
+        const existingMap = new Map(prev.map(m => [m.coin, m]))
+        const newMarkets: Market[] = []
 
-        newTokenMap.set(m.upToken, { coin: m.coin, side: 'up' })
-        newTokenMap.set(m.downToken, { coin: m.coin, side: 'down' })
-      }
+        for (const m of data) {
+          const existing = existingMap.get(m.coin)
+          newMarkets.push({
+            coin: m.coin,
+            windowTs: m.windowTs,
+            windowStart: m.windowStart,
+            windowEnd: m.windowEnd,
+            upToken: m.upToken,
+            downToken: m.downToken,
+            upBid: existing?.upBid || 0,
+            upAsk: existing?.upAsk || m.upPrice || 1,
+            downBid: existing?.downBid || 0,
+            downAsk: existing?.downAsk || m.downPrice || 1,
+            upBook: existing?.upBook || { bids: [], asks: [] },
+            downBook: existing?.downBook || { bids: [], asks: [] },
+            volume: m.volume || 0,
+            liquidity: m.liquidity || 0,
+            title: m.title || '',
+            conditionId: m.conditionId || '',
+            slug: m.slug || '',
+            spread: m.spread,
+            competitive: m.competitive || 0,
+          })
 
-      tokenMapRef.current = newTokenMap
-      setMarkets(newMarkets)
-      if (!selectedCoin && newMarkets.length > 0) {
-        setSelectedCoin(newMarkets[0].coin)
+          newTokenMap.set(m.upToken, { coin: m.coin, side: 'up' })
+          newTokenMap.set(m.downToken, { coin: m.coin, side: 'down' })
+        }
+
+        tokenMapRef.current = newTokenMap
+        return newMarkets
+      })
+
+      if (!selectedCoin && data.length > 0) {
+        setSelectedCoin(data[0].coin)
       }
-      return newMarkets
+      return data
     } catch (err) {
       console.error('failed to fetch markets:', err)
       return []
@@ -170,6 +182,7 @@ export default function Dashboard() {
         if (!data) return
 
         if (data.event_type === 'price_change') {
+          if (!clobReady) setClobReady(true)
           for (const pc of data.price_changes || []) {
             const info = tokenMapRef.current.get(pc.asset_id)
             if (!info) continue
@@ -354,9 +367,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     const init = async () => {
-      const mkts = await fetchMarkets()
-      if (mkts.length > 0) {
-        const tokens = mkts.flatMap(m => [m.upToken, m.downToken])
+      const data = await fetchMarkets()
+      if (data && data.length > 0) {
+        const tokens = data.flatMap((m: any) => [m.upToken, m.downToken])
         connectClob(tokens)
       }
       connectPrices()
@@ -432,10 +445,10 @@ export default function Dashboard() {
 
       {/* alerts + edge heatmap row */}
       <div className="grid grid-cols-12 gap-4 mb-4">
-        {/* arb alerts */}
+        {/* maker alerts (combined bid < threshold) */}
         <div className="col-span-4 bg-[#111] border border-gray-800 rounded-lg p-3">
           <div className="flex justify-between items-center mb-2">
-            <span className="text-sm text-gray-400">ARB ALERTS</span>
+            <span className="text-sm text-gray-400">MAKER ALERTS</span>
             <div className="flex items-center gap-2 text-xs">
               <span className="text-gray-500">thresh:</span>
               <input
@@ -456,8 +469,8 @@ export default function Dashboard() {
               alerts.slice(0, 10).map(a => (
                 <div key={a.id} className="flex justify-between items-center text-xs bg-green-500/10 px-2 py-1 rounded">
                   <span className={`font-medium uppercase ${coinColors[a.coin]}`}>{a.coin}</span>
-                  <span className="text-cyan-400">{a.combinedBid.toFixed(3)}</span>
-                  <span className="text-green-400">+{(a.edge * 100).toFixed(1)}%</span>
+                  <span className="text-cyan-400">{a.combinedBid?.toFixed(3) || '--'}</span>
+                  <span className="text-green-400">+{((a.edge || 0) * 100).toFixed(1)}%</span>
                   <span className="text-gray-500">{Math.floor((Date.now() - a.timestamp) / 1000)}s</span>
                 </div>
               ))
@@ -465,30 +478,33 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* edge heatmap */}
+        {/* maker edge heatmap (combined BID) */}
         <div className="col-span-8 bg-[#111] border border-gray-800 rounded-lg p-3">
-          <div className="text-sm text-gray-400 mb-2">EDGE HEATMAP</div>
+          <div className="text-sm text-gray-400 mb-2">MAKER EDGE <span className="text-gray-600">(combined bid)</span></div>
           <div className="grid grid-cols-4 gap-2">
             {markets.map(m => {
-              const combined = m.upAsk + m.downAsk
-              const edge = Math.max(0, 1 - combined)
-              const hasEdge = combined < 1
+              const combinedBid = m.upBid + m.downBid
+              const edge = Math.max(0, 1 - combinedBid)
+              const hasEdge = combinedBid > 0 && combinedBid < 1
               const bgColor = hasEdge
-                ? edge > 0.02 ? 'bg-green-500/20' : edge > 0.01 ? 'bg-yellow-500/20' : 'bg-orange-500/20'
+                ? edge > 0.03 ? 'bg-green-500/30' : edge > 0.02 ? 'bg-green-500/20' : 'bg-cyan-500/20'
                 : 'bg-gray-800/50'
 
               return (
                 <div
                   key={m.coin}
-                  onClick={() => setSelectedCoin(m.coin)}
+                  onClick={() => { setSelectedCoin(m.coin); setViewingWindowTs(null) }}
                   className={`${bgColor} rounded p-2 cursor-pointer border ${
                     selectedCoin === m.coin ? 'border-blue-500' : 'border-transparent'
                   } transition-all hover:border-gray-600`}
                 >
                   <div className={`text-sm font-semibold uppercase ${coinColors[m.coin]}`}>{m.coin}</div>
-                  <div className="text-lg font-medium">{combined.toFixed(3)}</div>
+                  <div className="flex justify-between items-baseline">
+                    <div className="text-lg font-medium text-cyan-400">{combinedBid > 0 ? combinedBid.toFixed(2) : '--'}</div>
+                    <div className="text-xs text-gray-500">bid</div>
+                  </div>
                   <div className={`text-sm ${hasEdge ? 'text-green-400' : 'text-gray-500'}`}>
-                    {hasEdge ? `+${(edge * 100).toFixed(2)}%` : '--'}
+                    {hasEdge ? `+${(edge * 100).toFixed(1)}%` : '--'}
                   </div>
                 </div>
               )
@@ -506,30 +522,31 @@ export default function Dashboard() {
             <div className="grid grid-cols-2 gap-3">
               {markets.map(m => {
                 const spotPrice = prices[m.coin] || 0
-                const combined = m.upAsk + m.downAsk
+                const combinedBid = m.upBid + m.downBid
+                const hasEdge = combinedBid > 0 && combinedBid < 1
                 const isSelected = m.coin === selectedCoin
 
                 return (
                   <div
                     key={m.coin}
-                    onClick={() => setSelectedCoin(m.coin)}
+                    onClick={() => { setSelectedCoin(m.coin); setViewingWindowTs(null) }}
                     className={`bg-[#111] border rounded-lg p-3 cursor-pointer transition-all ${
                       isSelected ? 'border-blue-500' : 'border-gray-800 hover:border-gray-700'
                     }`}
                   >
                     <div className="flex justify-between items-center mb-2">
                       <span className={`text-base font-semibold uppercase ${coinColors[m.coin]}`}>{m.coin}</span>
-                      <span className="text-base font-medium">${formatPrice(spotPrice, m.coin)}</span>
+                      <span className="text-sm text-gray-400">${formatPrice(spotPrice, m.coin)}</span>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2 mb-2">
+                    <div className="grid grid-cols-2 gap-2 mb-2 text-xs">
                       <div className="text-center">
-                        <div className="text-xs text-gray-500">UP</div>
-                        <div className="text-sm text-green-400">{m.upAsk.toFixed(2)}</div>
+                        <div className="text-gray-600">UP bid</div>
+                        <div className="text-cyan-400 font-medium">{m.upBid > 0 ? m.upBid.toFixed(2) : '--'}</div>
                       </div>
                       <div className="text-center">
-                        <div className="text-xs text-gray-500">DOWN</div>
-                        <div className="text-sm text-red-400">{m.downAsk.toFixed(2)}</div>
+                        <div className="text-gray-600">DOWN bid</div>
+                        <div className="text-cyan-400 font-medium">{m.downBid > 0 ? m.downBid.toFixed(2) : '--'}</div>
                       </div>
                     </div>
 
@@ -540,9 +557,12 @@ export default function Dashboard() {
                       />
                     </div>
 
-                    <div className="flex justify-between text-xs text-gray-500">
-                      <span className={combined < 1 ? 'text-yellow-400' : ''}>Σ {combined.toFixed(3)}</span>
-                      <span>{getTimeLeft(m.windowTs)}m</span>
+                    <div className="flex justify-between text-xs">
+                      <span className={hasEdge ? 'text-green-400' : 'text-gray-500'}>
+                        Σ {combinedBid > 0 ? combinedBid.toFixed(2) : '--'}
+                        {hasEdge && ` +${((1 - combinedBid) * 100).toFixed(0)}%`}
+                      </span>
+                      <span className="text-gray-500">{getTimeLeft(m.windowTs)}m</span>
                     </div>
                   </div>
                 )
@@ -585,11 +605,12 @@ export default function Dashboard() {
             {selectedMarket && prices[selectedCoin || ''] && (
               <WindowTracker
                 coin={selectedMarket.coin}
-                windowTs={selectedMarket.windowTs}
+                windowTs={viewingWindowTs || selectedMarket.windowTs}
                 currentPrice={prices[selectedMarket.coin] || 0}
                 upAsk={selectedMarket.upAsk}
                 downAsk={selectedMarket.downAsk}
                 onOpenPriceChange={(price) => setTargetPrices(prev => ({ ...prev, [selectedMarket.coin]: price }))}
+                onWindowChange={(ts) => setViewingWindowTs(ts)}
               />
             )}
 
@@ -645,26 +666,29 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* combined spread */}
+                {/* maker edge (combined bid) */}
                 <div className="mb-4 p-3 bg-[#0a0a0a] rounded-lg">
                   <div className="flex justify-between items-center">
                     <div>
-                      <span className="text-gray-500 text-sm">Combined Ask:</span>
-                      <span className={`ml-2 text-lg font-bold ${
-                        selectedMarket.upAsk + selectedMarket.downAsk < 1 ? 'text-yellow-400' : 'text-gray-200'
+                      <span className="text-gray-500 text-sm">Combined Bid:</span>
+                      <span className={`ml-2 text-xl font-bold ${
+                        selectedMarket.upBid + selectedMarket.downBid > 0 && selectedMarket.upBid + selectedMarket.downBid < 1
+                          ? 'text-green-400' : 'text-cyan-400'
                       }`}>
-                        {(selectedMarket.upAsk + selectedMarket.downAsk).toFixed(4)}
+                        {selectedMarket.upBid + selectedMarket.downBid > 0
+                          ? (selectedMarket.upBid + selectedMarket.downBid).toFixed(3)
+                          : '--'}
                       </span>
-                      {selectedMarket.upAsk + selectedMarket.downAsk < 1 && (
-                        <span className="ml-2 text-yellow-400 text-sm">
-                          ARB +{((1 - selectedMarket.upAsk - selectedMarket.downAsk) * 100).toFixed(2)}%
+                      {selectedMarket.upBid + selectedMarket.downBid > 0 && selectedMarket.upBid + selectedMarket.downBid < 1 && (
+                        <span className="ml-2 text-green-400 text-sm font-medium">
+                          +{((1 - selectedMarket.upBid - selectedMarket.downBid) * 100).toFixed(1)}% edge
                         </span>
                       )}
                     </div>
-                    <div>
-                      <span className="text-gray-500 text-sm">Combined Bid:</span>
-                      <span className="ml-2 text-lg font-medium">
-                        {(selectedMarket.upBid + selectedMarket.downBid).toFixed(4)}
+                    <div className="text-right">
+                      <span className="text-gray-600 text-xs">ask (taker):</span>
+                      <span className="ml-2 text-gray-400 text-sm">
+                        {(selectedMarket.upAsk + selectedMarket.downAsk).toFixed(3)}
                       </span>
                     </div>
                   </div>

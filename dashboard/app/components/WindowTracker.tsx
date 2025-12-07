@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 interface WindowRecord {
   coin: string
@@ -49,54 +49,45 @@ export default function WindowTracker({
   const [timeLeft, setTimeLeft] = useState({ mins: 0, secs: 0 })
   const [recentWindows, setRecentWindows] = useState<WindowRecord[]>([])
 
-  // fetch window data (PRICE TO BEAT)
-  const fetchWindowData = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/window?coin=${coin}&windowTs=${windowTs}`)
-      if (res.ok) {
-        const data = await res.json()
-        setWindowData({
-          openPrice: data.openPrice,
-          closePrice: data.closePrice,
-          completed: data.completed,
-          upPrice: data.upPrice,
-          downPrice: data.downPrice,
-        })
-        onOpenPriceChange?.(data.openPrice || null)
-
-        // save window record to sqlite
-        if (data.openPrice) {
-          fetch('/api/db/windows', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              windowTs,
-              coin,
-              slug: data.slug,
-              startTime: data.eventStartTime,
-              endTime: data.endDate,
-              openPrice: data.openPrice,
-              closePrice: data.closePrice,
-              upPrice: upAsk,
-              downPrice: downAsk,
-              combinedAsk: upAsk + downAsk,
-              resolved: data.completed,
-              outcome: data.closePrice && data.openPrice
-                ? (data.closePrice >= data.openPrice ? 'up' : 'down')
-                : null,
-              capturedAt: Date.now(),
-            })
-          }).catch(() => {})
-        }
-      }
-    } catch {}
-  }, [coin, windowTs, upAsk, downAsk, onOpenPriceChange])
-
+  // use refs to avoid callback recreation
+  const propsRef = useRef({ upAsk, downAsk, onOpenPriceChange })
   useEffect(() => {
+    propsRef.current = { upAsk, downAsk, onOpenPriceChange }
+  }, [upAsk, downAsk, onOpenPriceChange])
+
+  // fetch window data only when coin/windowTs changes
+  useEffect(() => {
+    let cancelled = false
+
+    const fetchWindowData = async () => {
+      try {
+        const res = await fetch(`/api/window?coin=${coin}&windowTs=${windowTs}`)
+        if (!res.ok || cancelled) return
+        const data = await res.json()
+        if (cancelled) return
+
+        if (data.openPrice !== undefined) {
+          setWindowData(prev => ({
+            openPrice: data.openPrice ?? prev?.openPrice ?? null,
+            closePrice: data.closePrice ?? prev?.closePrice ?? null,
+            completed: data.completed ?? prev?.completed ?? false,
+            upPrice: data.upPrice ?? prev?.upPrice ?? null,
+            downPrice: data.downPrice ?? prev?.downPrice ?? null,
+          }))
+          propsRef.current.onOpenPriceChange?.(data.openPrice || null)
+        }
+      } catch {}
+    }
+
+    setWindowData(null) // reset on window change
     fetchWindowData()
-    const interval = setInterval(fetchWindowData, 10000)
-    return () => clearInterval(interval)
-  }, [fetchWindowData])
+    const interval = setInterval(fetchWindowData, 30000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [coin, windowTs])
 
   // load recent windows from sqlite
   useEffect(() => {
