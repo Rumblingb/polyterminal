@@ -2,9 +2,10 @@
 
 ## Overview
 
-Two websocket feeds available:
+Three websocket feeds available:
 1. **CLOB Market** - orderbook and price updates
-2. **Chainlink Prices** - resolution oracle prices (what Polymarket actually uses)
+2. **Real Time Data Socket (RTDS)** - crypto prices, comments, activity
+3. **Chainlink On-Chain** - resolution oracle (direct Polygon read)
 
 ---
 
@@ -160,19 +161,130 @@ From testing (Dec 7, 2025):
 
 ---
 
-# 2. Chainlink Price WebSocket
+# 2. Real Time Data Socket (RTDS)
 
-**Critical:** Polymarket resolves using Chainlink, not Binance. This feed gives the actual resolution price.
+Official Polymarket streaming service for real-time data.
 
 ## Connection
 
 ```
-wss://ws-subscriptions-clob.polymarket.com/ws/prices
+wss://ws-live-data.polymarket.com
 ```
 
-(or similar endpoint - needs verification)
+Protocol: WebSocket
+Data Format: JSON
 
-## Subscription
+## Authentication
+
+Two types depending on subscription:
+
+**CLOB Authentication** (trading-related):
+```json
+{
+  "clob_auth": {
+    "key": "api_key",
+    "secret": "api_secret",
+    "passphrase": "api_passphrase"
+  }
+}
+```
+
+**Gamma Authentication** (user-specific):
+```json
+{
+  "gamma_auth": {
+    "address": "wallet_address"
+  }
+}
+```
+
+## Connection Management
+
+- Send PING messages every 5 seconds to maintain connection
+- Supports dynamic subscriptions (add/remove without disconnect)
+
+## Subscribe
+
+```json
+{
+  "action": "subscribe",
+  "subscriptions": [
+    {
+      "topic": "topic_name",
+      "type": "message_type",
+      "filters": "optional_filter_string"
+    }
+  ]
+}
+```
+
+## Unsubscribe
+
+```json
+{
+  "action": "unsubscribe",
+  "subscriptions": [
+    {
+      "topic": "topic_name",
+      "type": "message_type"
+    }
+  ]
+}
+```
+
+## Message Structure
+
+All messages follow this format:
+```json
+{
+  "topic": "string",
+  "type": "string",
+  "timestamp": 1753314064237,
+  "payload": {}
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| topic | Subscription topic (e.g., "crypto_prices") |
+| type | Event type (e.g., "update") |
+| timestamp | Unix milliseconds |
+| payload | Event-specific data |
+
+## Available Topics
+
+### crypto_prices (Binance)
+
+```json
+{
+  "action": "subscribe",
+  "subscriptions": [
+    {
+      "topic": "crypto_prices",
+      "type": "*",
+      "filters": ""
+    }
+  ]
+}
+```
+
+Response:
+```json
+{
+  "topic": "crypto_prices",
+  "type": "update",
+  "timestamp": 1753314064237,
+  "payload": {
+    "symbol": "btcusdt",
+    "timestamp": 1753314064213,
+    "value": 91520.00
+  }
+}
+```
+
+### crypto_prices_chainlink
+
+**Critical:** Polymarket resolves using Chainlink, not Binance.
 
 ```json
 {
@@ -187,8 +299,7 @@ wss://ws-subscriptions-clob.polymarket.com/ws/prices
 }
 ```
 
-### With Symbol Filter
-
+With symbol filter:
 ```json
 {
   "action": "subscribe",
@@ -202,8 +313,7 @@ wss://ws-subscriptions-clob.polymarket.com/ws/prices
 }
 ```
 
-## Message Format
-
+Response:
 ```json
 {
   "topic": "crypto_prices_chainlink",
@@ -217,52 +327,65 @@ wss://ws-subscriptions-clob.polymarket.com/ws/prices
 }
 ```
 
-### Payload Fields
+Supported symbols: `btc/usd`, `eth/usd`, `sol/usd`, `xrp/usd`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| symbol | string | Slash-separated pair (e.g., "btc/usd", "eth/usd") |
-| timestamp | number | Unix milliseconds |
-| value | number | Price in USD |
+### comments
 
-## Supported Symbols
+Comment and reaction events on markets.
 
-- `btc/usd`
-- `eth/usd`
-- `sol/usd`
-- `xrp/usd`
+## Price Source Comparison
 
-## Why This Matters
+| Source | Symbol Format | Use Case | Latency |
+|--------|---------------|----------|---------|
+| Binance (crypto_prices) | `btcusdt` | Real-time signals | Fastest |
+| Chainlink (crypto_prices_chainlink) | `btc/usd` | Resolution prediction | Slight delay |
 
-Polymarket 15m markets resolve based on **Chainlink Data Streams**, not Binance.
+**Oracle mismatch risk:** If you trade on Binance price but Chainlink differs at resolution, you lose even when "right". Use Chainlink for resolution-critical decisions.
 
-Oracle mismatch risk:
-- If you trade based on Binance price
-- But Chainlink shows different price at resolution
-- You can lose even when "right"
+---
 
-Using Chainlink feed eliminates oracle mismatch risk (~5% of trades).
+# 3. Chainlink On-Chain (Direct Read)
 
-## Binance vs Chainlink
+For guaranteed resolution price, read directly from Polygon Chainlink oracles.
 
-Also available: `crypto_prices` topic for Binance prices.
+## Contract Addresses (Polygon)
+
+| Coin | Address |
+|------|---------|
+| BTC | `0xc907E116054Ad103354f2D350FD2514433D57F6f` |
+| ETH | `0xF9680D99D6C9589e2a93a78A04A279e509205945` |
+| SOL | `0x10C8264C0935b3B9870013e057f330Ff3e9C56dC` |
+
+## ABI (latestRoundData)
 
 ```json
 {
-  "topic": "crypto_prices",
-  "type": "update",
-  "payload": {
-    "symbol": "btcusdt",
-    "timestamp": 1753314064213,
-    "value": 91520.00
-  }
+  "inputs": [],
+  "name": "latestRoundData",
+  "outputs": [
+    {"name": "roundId", "type": "uint80"},
+    {"name": "answer", "type": "int256"},
+    {"name": "startedAt", "type": "uint256"},
+    {"name": "updatedAt", "type": "uint256"},
+    {"name": "answeredInRound", "type": "uint80"}
+  ],
+  "stateMutability": "view",
+  "type": "function"
 }
 ```
 
-| Source | Symbol Format | Use Case |
-|--------|---------------|----------|
-| Binance | `btcusdt` | Real-time trading signals |
-| Chainlink | `btc/usd` | Resolution prediction |
+## Python Example
+
+```python
+from web3 import Web3
+
+w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+contract = w3.eth.contract(address=BTC_ADDRESS, abi=ABI)
+data = contract.functions.latestRoundData().call()
+price = data[1] / 1e8  # 8 decimals
+```
+
+See `chainlink.py` for full implementation.
 
 ---
 
