@@ -426,10 +426,10 @@ class RawCollector:
             self.collect_rtds(window_ts, window_end),
         )
 
-        # fetch resolution after window
-        await self.fetch_resolution(window_ts)
+        # fetch resolution in background (don't block next window)
+        asyncio.create_task(self.fetch_resolution(window_ts))
 
-        print(f'[done] clob={self.stats["clob"]} rtds={self.stats["rtds"]} gamma={self.stats["gamma"]} resolution={self.stats["resolution"]}')
+        print(f'[done] clob={self.stats["clob"]} rtds={self.stats["rtds"]} gamma={self.stats["gamma"]}')
 
     async def run(self):
         print('='*60)
@@ -438,6 +438,17 @@ class RawCollector:
         print('='*60)
 
         self.connect()
+
+        # on startup, check if we should join current window
+        now = int(time.time())
+        current_window = now - (now % 900)
+        elapsed = now - current_window
+
+        # if we're in first 10 min of window, join it
+        if elapsed < 600:
+            print(f'\n[startup] joining current window ({elapsed}s in)')
+            self.stats = {'clob': 0, 'rtds': 0, 'gamma': 0, 'resolution': 0}
+            await self.collect_window(current_window)
 
         while True:
             now = int(time.time())
