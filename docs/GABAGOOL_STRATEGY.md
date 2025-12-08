@@ -166,6 +166,29 @@ He keeps UP and DOWN positions within 10% of each other.
 3. **Volatility is your friend** - Price swings fill both sides
 4. **Resolution guarantee** - One side ALWAYS pays $1.00
 
+### The Key Insight: Early Window = Two-Way Flow
+
+The strategy works because **direction is unclear in minutes 0-4**:
+
+```
+Early window (min 0-4):
+  - Price near 50/50, direction uncertain
+  - SELL flow happens on BOTH sides (scalpers, traders, etc.)
+  - Your bids on both UP and DOWN get filled
+  - Result: Balanced fills at combined < $1.00
+
+Late window (min 10+):
+  - Direction becomes clear (one side ~$0.90+)
+  - Losers dump → adverse selection kicks in
+  - But you're already positioned from early fills
+```
+
+This is why gabagool does 45% of trades in first 4 minutes. Get in while the market is uncertain and fills are balanced.
+
+**The risk** is unbalanced fills late in the window. This is why rebalancing exists - to fix any imbalance before resolution.
+
+Combined with combined_bid < $1.00, balanced positions guarantee profit regardless of outcome.
+
 ---
 
 ## Execution Example
