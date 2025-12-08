@@ -25,8 +25,8 @@ class CoinStats:
     down_volume: float = 0
     up_trades: int = 0
     down_trades: int = 0
-    up_prices: list = field(default_factory=list)
-    down_prices: list = field(default_factory=list)
+    up_fills: list = field(default_factory=list)  # (price, size) tuples
+    down_fills: list = field(default_factory=list)
     edge_samples: list = field(default_factory=list)
     arb_ops: list = field(default_factory=list)
 
@@ -84,9 +84,9 @@ class CoinStats:
         # only track SELL trades as fills (someone selling into our bid)
         if trade_side == 'SELL':
             if side == 'up':
-                self.up_prices.append(price)
+                self.up_fills.append((price, size))
             else:
-                self.down_prices.append(price)
+                self.down_fills.append((price, size))
 
 
 class WindowAlerts:
@@ -126,6 +126,7 @@ class WindowAlerts:
 
         total_volume = 0
         total_trades = 0
+        total_pnl = 0
         all_arbs = []
         lines = [f'<b>Window {dt.strftime("%H:%M")} UTC</b>']
         lines.append('')
@@ -134,6 +135,16 @@ class WindowAlerts:
             total_volume += stats.total_volume
             total_trades += stats.total_trades
             all_arbs.extend([(coin, *arb) for arb in stats.arb_ops])
+
+            # accumulate pnl
+            up_shares = sum(s for _, s in stats.up_fills)
+            down_shares = sum(s for _, s in stats.down_fills)
+            if up_shares > 0 and down_shares > 0:
+                matched = min(up_shares, down_shares)
+                up_cost = sum(p * s for p, s in stats.up_fills)
+                down_cost = sum(p * s for p, s in stats.down_fills)
+                fill_edge = 1 - (up_cost / up_shares + down_cost / down_shares)
+                total_pnl += matched * fill_edge
 
             if stats.total_trades == 0:
                 lines.append(f'<b>{coin.upper()}</b>: no activity')
@@ -144,17 +155,26 @@ class WindowAlerts:
             min_edge = min(stats.edge_samples) * 100 if stats.edge_samples else 0
             max_edge = max(stats.edge_samples) * 100 if stats.edge_samples else 0
 
-            # fill prices (from SELL trades hitting our bids)
-            up_fill = sum(stats.up_prices) / len(stats.up_prices) if stats.up_prices else 0
-            dn_fill = sum(stats.down_prices) / len(stats.down_prices) if stats.down_prices else 0
-            combined_fill = up_fill + dn_fill
-            fill_edge = (1 - combined_fill) * 100 if combined_fill > 0 else 0
+            # calc pnl from fills
+            up_shares = sum(s for _, s in stats.up_fills)
+            down_shares = sum(s for _, s in stats.down_fills)
+            up_cost = sum(p * s for p, s in stats.up_fills)
+            down_cost = sum(p * s for p, s in stats.down_fills)
+
+            pnl = 0
+            if up_shares > 0 and down_shares > 0:
+                matched = min(up_shares, down_shares)
+                up_avg = up_cost / up_shares
+                down_avg = down_cost / down_shares
+                combined_fill = up_avg + down_avg
+                fill_edge = 1 - combined_fill
+                pnl = matched * fill_edge
 
             lines.append(f'<b>{coin.upper()}</b>')
             lines.append(f'  trades: {stats.up_trades} up / {stats.down_trades} dn')
             lines.append(f'  volume: ${stats.up_volume:.0f} up / ${stats.down_volume:.0f} dn')
-            if stats.up_prices or stats.down_prices:
-                lines.append(f'  fills: {up_fill:.3f} up / {dn_fill:.3f} dn = {combined_fill:.3f} ({fill_edge:+.1f}%)')
+            if up_shares > 0 or down_shares > 0:
+                lines.append(f'  fills: {up_shares:.0f} up / {down_shares:.0f} dn | <b>${pnl:+.2f}</b>')
             lines.append(f'  book edge: {avg_edge:+.1f}% avg ({min_edge:+.1f} to {max_edge:+.1f})')
             lines.append('')
 
@@ -169,6 +189,7 @@ class WindowAlerts:
         lines.append('<b>TOTALS</b>')
         lines.append(f'  volume: ${total_volume:.0f}')
         lines.append(f'  trades: {total_trades}')
+        lines.append(f'  pnl: <b>${total_pnl:+.2f}</b>')
         lines.append(f'  session: {self.session_windows} windows')
 
         msg = '\n'.join(lines)
