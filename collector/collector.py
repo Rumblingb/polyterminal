@@ -14,6 +14,8 @@ import aiohttp
 import websockets
 import clickhouse_connect
 
+from .alerts import WindowAlerts
+
 # endpoints
 CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 RTDS_WS = 'wss://ws-live-data.polymarket.com'
@@ -38,6 +40,7 @@ class RawCollector:
         self.clob_buffer = []
         self.rtds_buffer = []
         self.stats = {'clob': 0, 'rtds': 0, 'gamma': 0, 'resolution': 0}
+        self.alerts = WindowAlerts()
 
     def connect(self):
         if not CH_PASSWORD:
@@ -322,6 +325,28 @@ class RawCollector:
                             market,
                             raw
                         ))
+
+                        elapsed = now - window_ts
+
+                        # feed alerts module
+                        if event_type == 'price_change':
+                            for pc in data.get('price_changes', []):
+                                info = self.tokens.get(pc.get('asset_id'))
+                                if info:
+                                    coin, side = info
+                                    bid = float(pc.get('best_bid', 0))
+                                    ask = float(pc.get('best_ask', 1))
+                                    self.alerts.update_book(coin, side, bid, ask, elapsed)
+
+                        elif event_type == 'last_trade_price':
+                            info = self.tokens.get(data.get('asset_id'))
+                            if info:
+                                coin, side = info
+                                price = float(data.get('price', 0))
+                                size = float(data.get('size', 0))
+                                trade_side = data.get('side', '')  # BUY or SELL
+                                self.alerts.add_trade(coin, side, price, size, trade_side)
+
                     except:
                         # store anyway even if parse fails
                         self.clob_buffer.append((
@@ -420,11 +445,18 @@ class RawCollector:
             print('[!] no tokens found')
             return
 
+        # reset alerts for this window
+        coins = list(set(coin for coin, _ in self.tokens.values()))
+        self.alerts.reset(coins)
+
         # collect websockets in parallel
         await asyncio.gather(
             self.collect_clob(window_ts, window_end),
             self.collect_rtds(window_ts, window_end),
         )
+
+        # send telegram summary
+        await self.alerts.send_summary(window_ts, self.stats['clob'], self.stats['rtds'])
 
         # fetch resolution in background (don't block next window)
         asyncio.create_task(self.fetch_resolution(window_ts))
