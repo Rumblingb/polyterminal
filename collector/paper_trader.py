@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gabagool Paper Trader - runs alongside collector, sends Telegram updates
+Gabagool Paper Trader - tracks real order book, calculates edge
 BTC + ETH only
 """
 
@@ -9,7 +9,7 @@ import json
 import os
 import time
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiohttp
 import websockets
@@ -21,56 +21,59 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 COINS = ['btc', 'eth']
-FILL_RATE = 0.10  # simulate 10% of retail flow
 
 
 @dataclass
-class Position:
+class CoinBook:
     coin: str
-    up_shares: float = 0
-    up_cost: float = 0
-    down_shares: float = 0
-    down_cost: float = 0
+    up_bid: float = 0
+    up_ask: float = 1
+    down_bid: float = 0
+    down_ask: float = 1
+    up_fills: list = field(default_factory=list)
+    down_fills: list = field(default_factory=list)
 
     @property
-    def matched(self):
-        return min(self.up_shares, self.down_shares)
-
-    @property
-    def up_avg(self):
-        return self.up_cost / self.up_shares if self.up_shares else 0
-
-    @property
-    def down_avg(self):
-        return self.down_cost / self.down_shares if self.down_shares else 0
-
-    @property
-    def combined(self):
-        if self.up_shares == 0 or self.down_shares == 0:
-            return 1.0
-        return self.up_avg + self.down_avg
+    def combined_bid(self):
+        return self.up_bid + self.down_bid
 
     @property
     def edge(self):
-        return 1.0 - self.combined
+        return 1.0 - self.combined_bid if self.combined_bid < 1 else 0
 
-    @property
-    def imbalance(self):
-        total = self.up_shares + self.down_shares
-        return abs(self.up_shares - self.down_shares) / total if total else 0
+    def add_fill(self, side: str, price: float, size: float):
+        if side == 'up':
+            self.up_fills.append((price, size))
+        else:
+            self.down_fills.append((price, size))
 
-    def expected_pnl(self):
-        matched_pnl = self.matched * self.edge
-        unmatched_up = max(0, self.up_shares - self.down_shares)
-        unmatched_down = max(0, self.down_shares - self.up_shares)
-        unmatched_ev = unmatched_up * (0.5 - self.up_avg) + unmatched_down * (0.5 - self.down_avg)
-        return matched_pnl + unmatched_ev
+    def calc_pnl(self):
+        up_shares = sum(s for _, s in self.up_fills)
+        down_shares = sum(s for _, s in self.down_fills)
+        up_cost = sum(p * s for p, s in self.up_fills)
+        down_cost = sum(p * s for p, s in self.down_fills)
+
+        if up_shares == 0 or down_shares == 0:
+            return 0, 0, 0, 1.0
+
+        matched = min(up_shares, down_shares)
+        up_avg = up_cost / up_shares
+        down_avg = down_cost / down_shares
+        combined = up_avg + down_avg
+        edge = 1.0 - combined
+
+        matched_pnl = matched * edge
+        unmatched_up = max(0, up_shares - down_shares)
+        unmatched_down = max(0, down_shares - up_shares)
+        unmatched_ev = unmatched_up * (0.5 - up_avg) + unmatched_down * (0.5 - down_avg)
+
+        return matched_pnl + unmatched_ev, up_shares, down_shares, combined
 
 
 class PaperTrader:
     def __init__(self):
         self.tokens = {}
-        self.positions = {}
+        self.books = {}
         self.results = []
         self.session_pnl = 0
 
@@ -92,7 +95,7 @@ class PaperTrader:
 
     async def fetch_markets(self, window_ts: int):
         self.tokens.clear()
-        self.positions.clear()
+        self.books.clear()
 
         async with aiohttp.ClientSession() as session:
             for coin in COINS:
@@ -113,7 +116,7 @@ class PaperTrader:
                         if len(tokens) >= 2:
                             self.tokens[tokens[0]] = (coin, 'up')
                             self.tokens[tokens[1]] = (coin, 'down')
-                            self.positions[coin] = Position(coin=coin)
+                            self.books[coin] = CoinBook(coin=coin)
 
                 except Exception as e:
                     print(f'[paper] {coin} error: {e}')
@@ -148,33 +151,45 @@ class PaperTrader:
                         if isinstance(data, list):
                             data = data[0] if data else {}
 
-                        if data.get('event_type') != 'last_trade_price':
-                            continue
-                        if data.get('side') != 'SELL':
-                            continue
-                        if now >= accumulate_end:
-                            continue
+                        event_type = data.get('event_type')
 
-                        token_id = data.get('asset_id')
-                        info = self.tokens.get(token_id)
-                        if not info:
-                            continue
+                        # track order book
+                        if event_type == 'price_change':
+                            for pc in data.get('price_changes', []):
+                                info = self.tokens.get(pc.get('asset_id'))
+                                if not info:
+                                    continue
+                                coin, side = info
+                                book = self.books.get(coin)
+                                if not book:
+                                    continue
 
-                        coin, side = info
-                        pos = self.positions.get(coin)
-                        if not pos:
-                            continue
+                                if side == 'up':
+                                    book.up_bid = float(pc.get('best_bid', 0))
+                                    book.up_ask = float(pc.get('best_ask', 1))
+                                else:
+                                    book.down_bid = float(pc.get('best_bid', 0))
+                                    book.down_ask = float(pc.get('best_ask', 1))
 
-                        price = float(data.get('price', 0))
-                        size = float(data.get('size', 0))
-                        fill = size * FILL_RATE
+                        # track fills (SELL = retail selling to us)
+                        elif event_type == 'last_trade_price':
+                            if data.get('side') != 'SELL':
+                                continue
+                            if now >= accumulate_end:
+                                continue
 
-                        if side == 'up':
-                            pos.up_shares += fill
-                            pos.up_cost += fill * price
-                        else:
-                            pos.down_shares += fill
-                            pos.down_cost += fill * price
+                            info = self.tokens.get(data.get('asset_id'))
+                            if not info:
+                                continue
+
+                            coin, side = info
+                            book = self.books.get(coin)
+                            if not book:
+                                continue
+
+                            price = float(data.get('price', 0))
+                            size = float(data.get('size', 0))
+                            book.add_fill(side, price, size)
 
                     except:
                         pass
@@ -186,19 +201,25 @@ class PaperTrader:
         total_pnl = 0
         lines = [f'<b>📊 Window {dt.strftime("%H:%M")} UTC</b>\n']
 
-        for coin, pos in sorted(self.positions.items()):
-            if pos.up_shares == 0 and pos.down_shares == 0:
+        for coin, book in sorted(self.books.items()):
+            pnl, up_shares, down_shares, combined = book.calc_pnl()
+
+            if up_shares == 0 and down_shares == 0:
+                # no fills, just show book state
+                lines.append(
+                    f'⚪ <b>{coin.upper()}</b>: no fills | '
+                    f'book ${book.combined_bid:.3f} ({book.edge*100:+.1f}%)'
+                )
                 continue
 
-            pnl = pos.expected_pnl()
             total_pnl += pnl
+            edge = 1.0 - combined
 
             emoji = '🟢' if pnl > 0 else '🔴' if pnl < 0 else '⚪'
             lines.append(
                 f'{emoji} <b>{coin.upper()}</b>: '
-                f'↑{pos.up_shares:.0f} ↓{pos.down_shares:.0f} | '
-                f'${pos.combined:.3f} | '
-                f'{pos.edge*100:+.1f}% | '
+                f'↑{up_shares:.0f} ↓{down_shares:.0f} | '
+                f'${combined:.3f} ({edge*100:+.1f}%) | '
                 f'<b>${pnl:+.2f}</b>'
             )
 
