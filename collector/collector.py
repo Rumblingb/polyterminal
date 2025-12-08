@@ -234,35 +234,45 @@ class RawCollector:
         print(f'[gamma] {self.stats["gamma"]} responses, {len(self.tokens)} tokens')
 
     async def fetch_resolution(self, window_ts: int):
-        """fetch crypto-price api after window ends"""
-        print('[resolution] fetching...')
-        await asyncio.sleep(30)  # wait for resolution
+        """fetch resolution from gamma api after window ends"""
+        print('[resolution] waiting 60s for markets to close...')
+        await asyncio.sleep(60)
 
         async with aiohttp.ClientSession() as session:
-            for coin, times in self.market_times.items():
-                start_time, end_time = times
+            for coin in COINS:
+                slug = f'{coin}-updown-15m-{window_ts}'
                 try:
-                    url = f'{CRYPTO_PRICE_API}?symbol={coin.upper()}&eventStartTime={start_time}&variant=fifteen&endDate={end_time}'
-                    async with session.get(url) as resp:
+                    # get market with resolution from gamma
+                    async with session.get(f'{GAMMA_API}/markets?slug={slug}') as resp:
                         if resp.status != 200:
                             continue
 
                         raw = await resp.text()
+                        data_list = json.loads(raw)
+                        if not data_list:
+                            continue
+                        data = data_list[0] if isinstance(data_list, list) else data_list
+
+                        # check if resolved
+                        if not data.get('closed'):
+                            print(f'  [{coin}] not closed yet')
+                            continue
+
+                        # store raw response
                         if self.client:
                             self.client.insert('crypto_prices', [
                                 (datetime.utcnow(), window_ts, coin, raw)
                             ], column_names=['ts', 'window_ts', 'coin', 'raw'])
                             self.stats['resolution'] += 1
 
-                        # log outcome
-                        try:
-                            data = json.loads(raw)
-                            op, cp = data.get('openPrice'), data.get('closePrice')
-                            if op and cp:
-                                outcome = 'UP' if cp > op else 'DOWN'
+                        # parse outcome from outcomePrices
+                        outcome_prices = data.get('outcomePrices', [])
+                        outcomes = data.get('outcomes', ['Up', 'Down'])
+                        if outcome_prices:
+                            winner_idx = outcome_prices.index('1') if '1' in outcome_prices else -1
+                            if winner_idx >= 0:
+                                outcome = outcomes[winner_idx].upper()
                                 print(f'  [{coin}] {outcome}')
-                        except:
-                            pass
 
                 except Exception as e:
                     print(f'  [{coin}] error: {e}')
