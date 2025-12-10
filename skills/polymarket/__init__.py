@@ -5,6 +5,7 @@
 #   data_api - enriched trades with metadata
 #   gamma    - market metadata, token mapping
 #   clob     - orderbook, prices
+#   markets  - market discovery and search
 #   wallet   - high-level wallet analysis
 
 from .subgraph import (
@@ -42,8 +43,23 @@ from .clob import (
     get_midpoint,
     get_combined_spread,
     estimate_fill,
-    get_markets,
-    get_market
+    get_markets as get_clob_markets,
+    get_market as get_clob_market
+)
+
+from .markets import (
+    get_trending,
+    get_active_markets,
+    search_markets,
+    get_markets_by_category,
+    get_categories,
+    get_market_details,
+    get_event,
+    get_events,
+    get_15m_markets,
+    get_current_15m_window,
+    get_market_summary,
+    get_price_history
 )
 
 from .wallet import (

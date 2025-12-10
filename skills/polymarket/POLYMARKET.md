@@ -327,6 +327,70 @@ python clob.py markets [--limit N]
 
 ---
 
+### markets.py - Market Discovery & Search
+
+Find markets by volume, category, search. Get market details and summaries.
+
+#### Functions
+
+```python
+from markets import get_trending, search_markets, get_market_details
+
+# top markets by 24h volume
+trending = get_trending(limit=20, timeframe='24hr')
+# timeframe: '24hr', '1wk', '1mo', '1yr'
+
+# search markets
+results = search_markets('bitcoin', limit=10, active_only=True)
+
+# get active markets
+active = get_active_markets(limit=50, offset=0)
+
+# get markets by category
+sports = get_markets_by_category('Sports', limit=20)
+
+# list all categories
+categories = get_categories()
+
+# get market details (full info)
+market = get_market_details(slug='fed-rate-hike-in-2025')
+market = get_market_details(condition_id='0xa69a...')
+
+# get event (group of markets)
+event = get_event(slug='fed-rate-hike-in-2025')
+
+# list events
+events = get_events(active=True, limit=20)
+
+# get 15m updown markets
+markets = get_15m_markets(coin='btc')
+
+# get current 15m window for all coins
+windows = get_current_15m_window()
+# returns: {'btc': {...}, 'eth': {...}, 'sol': {...}, 'xrp': {...}}
+
+# get full market summary with orderbook data
+summary = get_market_summary(slug='fed-rate-hike-in-2025')
+
+# get price history (from CLOB)
+history = get_price_history(condition_id, interval='1h', fidelity=1)
+```
+
+#### CLI
+
+```bash
+python markets.py trending [--limit N]
+python markets.py search <query> [--limit N]
+python markets.py categories
+python markets.py category <name> [--limit N]
+python markets.py details <slug>
+python markets.py event <slug>
+python markets.py active [--limit N]
+python markets.py 15m [--coin btc]
+```
+
+---
+
 ### wallet.py - Wallet Analysis
 
 High-level wallet analysis combining all data sources.
@@ -501,21 +565,31 @@ while True:
 ## Quick Reference
 
 ```bash
+# market discovery
+python markets.py trending --limit 10
+python markets.py search "bitcoin" --limit 5
+python markets.py 15m
+python markets.py details fed-rate-hike-in-2025
+
 # wallet analysis
 python wallet.py analyze 0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d
+python wallet.py positions 0x6031...
+python wallet.py pnl 0x6031...
 
-# recent trades (source of truth)
+# trades (source of truth)
 python subgraph.py trades 0x6031... --limit 50
+python subgraph.py count 0x6031...
 
 # enriched trades with market names
 python data_api.py wallet 0x6031... --limit 50
+python data_api.py recent --limit 20
 
 # token → market mapping
-python gamma.py token 61923092091334188627528323105566170821412876265586507721670399894720705370985
+python gamma.py token 61923092...
+python gamma.py slug btc-updown-15m-1765344600
 
 # orderbook
 python clob.py book 61923092...
-
-# spread
 python clob.py spread 61923092...
+python clob.py depth 61923092... --levels 10
 ```
