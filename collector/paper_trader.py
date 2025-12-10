@@ -159,6 +159,22 @@ class PaperTrader:
         return True
 
     def init_tables(self):
+        # limit orders we'd post
+        self.client.command('''
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                ts DateTime64(3),
+                window_ts UInt32,
+                coin LowCardinality(String),
+                side LowCardinality(String),
+                price Float64,
+                size Float64,
+                cost Float64
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMMDD(ts)
+            ORDER BY (window_ts, coin, side, ts)
+            TTL ts + INTERVAL 90 DAY
+        ''')
+
         # individual fills
         self.client.command('''
             CREATE TABLE IF NOT EXISTS paper_fills (
@@ -209,6 +225,23 @@ class PaperTrader:
             size,
             price * size
         ))
+
+    def store_order(self, window_ts: int, coin: str, side: str, price: float, size: float):
+        """store limit order we would post"""
+        if not self.client:
+            return
+        try:
+            self.client.insert('paper_orders', [(
+                datetime.utcnow(),
+                window_ts,
+                coin,
+                side,
+                price,
+                size,
+                price * size
+            )], column_names=['ts', 'window_ts', 'coin', 'side', 'price', 'size', 'cost'])
+        except Exception as e:
+            print(f'[ch] order store error: {e}')
 
     def flush_fills(self):
         if not self.client or not self.fill_buffer:
@@ -338,14 +371,24 @@ class PaperTrader:
                                 if not book:
                                     continue
 
+                                bid = float(pc.get('best_bid', 0))
+                                ask = float(pc.get('best_ask', 1))
+
                                 if side == 'up':
-                                    book.up_bid = float(pc.get('best_bid', 0))
-                                    book.up_ask = float(pc.get('best_ask', 1))
+                                    book.up_bid = bid
+                                    book.up_ask = ask
+                                    capital = book.capital_up
                                 else:
-                                    book.down_bid = float(pc.get('best_bid', 0))
-                                    book.down_ask = float(pc.get('best_ask', 1))
+                                    book.down_bid = bid
+                                    book.down_ask = ask
+                                    capital = book.capital_down
 
                                 book.sample_edge()
+
+                                # store limit order we'd post (only during accumulate, with edge)
+                                if now < accumulate_end and capital >= MIN_ORDER_SIZE and book.edge > 0 and bid > 0:
+                                    order_size = capital / bid
+                                    self.store_order(window_ts, coin, side, bid, order_size)
 
                         elif event_type == 'last_trade_price':
                             info = self.tokens.get(data.get('asset_id'))
