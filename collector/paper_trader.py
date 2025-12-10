@@ -141,6 +141,8 @@ class PaperTrader:
         self.session_capital = 0
         self.client = None
         self.fill_buffer = []
+        self.order_buffer = []
+        self.last_order_store = {}
 
     def connect_ch(self):
         if not CH_PASSWORD:
@@ -226,22 +228,39 @@ class PaperTrader:
             price * size
         ))
 
-    def store_order(self, window_ts: int, coin: str, side: str, price: float, size: float):
-        """store limit order we would post"""
+    def store_order(self, window_ts: int, coin: str, side: str, price: float, size: float, now: float):
+        """store limit order we would post - sample every 5s or on price change"""
         if not self.client:
             return
+
+        key = f'{coin}_{side}'
+        last = self.last_order_store.get(key, (0, 0))
+        last_time, last_price = last
+
+        # only store every 5s or if price changed by >1%
+        if now - last_time < 5 and abs(price - last_price) / last_price < 0.01 if last_price > 0 else False:
+            return
+
+        self.last_order_store[key] = (now, price)
+        self.order_buffer.append((
+            datetime.utcnow(),
+            window_ts,
+            coin,
+            side,
+            price,
+            size,
+            price * size
+        ))
+
+    def flush_orders(self):
+        if not self.client or not self.order_buffer:
+            return
         try:
-            self.client.insert('paper_orders', [(
-                datetime.utcnow(),
-                window_ts,
-                coin,
-                side,
-                price,
-                size,
-                price * size
-            )], column_names=['ts', 'window_ts', 'coin', 'side', 'price', 'size', 'cost'])
+            self.client.insert('paper_orders', self.order_buffer,
+                column_names=['ts', 'window_ts', 'coin', 'side', 'price', 'size', 'cost'])
+            self.order_buffer.clear()
         except Exception as e:
-            print(f'[ch] order store error: {e}')
+            print(f'[ch] order flush error: {e}')
 
     def flush_fills(self):
         if not self.client or not self.fill_buffer:
@@ -338,6 +357,7 @@ class PaperTrader:
         if not self.tokens:
             return
 
+        self.last_order_store.clear()
         fills_log = []
 
         try:
@@ -388,7 +408,7 @@ class PaperTrader:
                                 # store limit order we'd post (only during accumulate, with edge)
                                 if now < accumulate_end and capital >= MIN_ORDER_SIZE and book.edge > 0 and bid > 0:
                                     order_size = capital / bid
-                                    self.store_order(window_ts, coin, side, bid, order_size)
+                                    self.store_order(window_ts, coin, side, bid, order_size, now)
 
                         elif event_type == 'last_trade_price':
                             info = self.tokens.get(data.get('asset_id'))
@@ -461,6 +481,7 @@ class PaperTrader:
 
         # store to clickhouse
         self.flush_fills()
+        self.flush_orders()
         for coin, book in self.books.items():
             self.store_window(window_ts, coin, book)
 
