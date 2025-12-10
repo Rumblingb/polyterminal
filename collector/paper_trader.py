@@ -14,8 +14,14 @@ from dataclasses import dataclass, field
 
 import aiohttp
 import websockets
+import clickhouse_connect
 
 GAMMA_API = 'https://gamma-api.polymarket.com'
+
+# clickhouse
+CH_HOST = os.environ.get('CLICKHOUSE_HOST', 'n60fu3ciqd.eastus2.azure.clickhouse.cloud')
+CH_USER = os.environ.get('CLICKHOUSE_USER', 'default')
+CH_PASSWORD = os.environ.get('CLICKHOUSE_PASSWORD', '')
 CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
@@ -133,6 +139,115 @@ class PaperTrader:
         self.results = []
         self.session_pnl = 0
         self.session_capital = 0
+        self.client = None
+        self.fill_buffer = []
+
+    def connect_ch(self):
+        if not CH_PASSWORD:
+            print('[ch] no password, dry-run mode')
+            return False
+
+        self.client = clickhouse_connect.get_client(
+            host=CH_HOST,
+            port=8443,
+            username=CH_USER,
+            password=CH_PASSWORD,
+            secure=True
+        )
+        print(f'[ch] connected to {CH_HOST}')
+        self.init_tables()
+        return True
+
+    def init_tables(self):
+        # individual fills
+        self.client.command('''
+            CREATE TABLE IF NOT EXISTS paper_fills (
+                ts DateTime64(3),
+                window_ts UInt32,
+                coin LowCardinality(String),
+                side LowCardinality(String),
+                price Float64,
+                size Float64,
+                cost Float64
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMMDD(ts)
+            ORDER BY (window_ts, coin, side, ts)
+            TTL ts + INTERVAL 90 DAY
+        ''')
+
+        # window summaries
+        self.client.command('''
+            CREATE TABLE IF NOT EXISTS paper_windows (
+                ts DateTime64(3),
+                window_ts UInt32,
+                coin LowCardinality(String),
+                up_shares Float64,
+                down_shares Float64,
+                up_cost Float64,
+                down_cost Float64,
+                pnl Float64,
+                avg_edge Float64,
+                market_up_sells Float64,
+                market_down_sells Float64
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMMDD(ts)
+            ORDER BY (window_ts, coin)
+            TTL ts + INTERVAL 90 DAY
+        ''')
+
+        print('[ch] paper tables ready')
+
+    def store_fill(self, window_ts: int, coin: str, side: str, price: float, size: float):
+        if not self.client:
+            return
+        self.fill_buffer.append((
+            datetime.utcnow(),
+            window_ts,
+            coin,
+            side,
+            price,
+            size,
+            price * size
+        ))
+
+    def flush_fills(self):
+        if not self.client or not self.fill_buffer:
+            return
+        try:
+            self.client.insert('paper_fills', self.fill_buffer,
+                column_names=['ts', 'window_ts', 'coin', 'side', 'price', 'size', 'cost'])
+            self.fill_buffer.clear()
+        except Exception as e:
+            print(f'[ch] fill flush error: {e}')
+
+    def store_window(self, window_ts: int, coin: str, book):
+        if not self.client:
+            return
+        up_shares = sum(s for _, s in book.up_fills)
+        down_shares = sum(s for _, s in book.down_fills)
+        up_cost = sum(p * s for p, s in book.up_fills)
+        down_cost = sum(p * s for p, s in book.down_fills)
+        avg_edge = sum(book.edge_samples) / len(book.edge_samples) if book.edge_samples else 0
+        pnl, _, _, _, _ = book.calc_pnl()
+
+        try:
+            self.client.insert('paper_windows', [(
+                datetime.utcnow(),
+                window_ts,
+                coin,
+                up_shares,
+                down_shares,
+                up_cost,
+                down_cost,
+                pnl,
+                avg_edge,
+                book.market_up_sells,
+                book.market_down_sells
+            )], column_names=['ts', 'window_ts', 'coin', 'up_shares', 'down_shares',
+                              'up_cost', 'down_cost', 'pnl', 'avg_edge',
+                              'market_up_sells', 'market_down_sells'])
+        except Exception as e:
+            print(f'[ch] window store error: {e}')
 
     async def send_telegram(self, msg: str):
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -256,6 +371,7 @@ class PaperTrader:
                                     fill = book.try_fill(side, price, size)
                                     if fill > 0:
                                         fills_log.append(f'{elapsed:.0f}s {coin}/{side} {fill:.1f}@${price:.2f}')
+                                        self.store_fill(window_ts, coin, side, price, fill)
 
                     except:
                         pass
@@ -300,6 +416,11 @@ class PaperTrader:
         self.session_capital += total_capital
         self.results.append({'window': window_ts, 'pnl': total_pnl, 'capital': total_capital})
 
+        # store to clickhouse
+        self.flush_fills()
+        for coin, book in self.books.items():
+            self.store_window(window_ts, coin, book)
+
         # summary
         roi = (total_pnl / total_capital * 100) if total_capital > 0 else 0
         session_roi = (self.session_pnl / self.session_capital * 100) if self.session_capital > 0 else 0
@@ -319,6 +440,8 @@ class PaperTrader:
         print(f'Fill rate: {FILL_RATE*100:.0f}% of market SELL flow')
         print(f'Coins: {COINS}')
         print('=' * 60)
+
+        self.connect_ch()
 
         startup_msg = (
             f'<b>Paper Trader Started</b>\n'
