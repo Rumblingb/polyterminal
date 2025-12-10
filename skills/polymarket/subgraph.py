@@ -46,15 +46,18 @@ def get_wallet_trades(wallet: str, limit: int = 100, skip: int = 0,
     wallet = wallet.lower()
 
     # build where clause
-    if role == 'maker':
-        where = f'maker: "{wallet}"'
-    elif role == 'taker':
-        where = f'taker: "{wallet}"'
-    else:
-        where = f'or: [{{maker: "{wallet}"}}, {{taker: "{wallet}"}}]'
+    ts_filter = f', timestamp_gt: "{since_ts}"' if since_ts else ''
 
-    if since_ts:
-        where += f', timestamp_gt: "{since_ts}"'
+    if role == 'maker':
+        where = f'maker: "{wallet}"{ts_filter}'
+    elif role == 'taker':
+        where = f'taker: "{wallet}"{ts_filter}'
+    else:
+        # for 'both', need to include timestamp filter in each or clause
+        if since_ts:
+            where = f'or: [{{maker: "{wallet}", timestamp_gt: "{since_ts}"}}, {{taker: "{wallet}", timestamp_gt: "{since_ts}"}}]'
+        else:
+            where = f'or: [{{maker: "{wallet}"}}, {{taker: "{wallet}"}}]'
 
     query = f'''
     {{

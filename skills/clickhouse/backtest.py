@@ -51,6 +51,7 @@ def run_backtest(coin='btc', capital_per_side=50, max_windows=0):
 
         # state
         depth_ahead = {'up': 0, 'down': 0}
+        best_bid = {'up': 0, 'down': 0}
         my_capital = {'up': capital_per_side, 'down': capital_per_side}
         my_fills = {'up': [], 'down': []}
 
@@ -68,28 +69,34 @@ def run_backtest(coin='btc', capital_per_side=50, max_windows=0):
                 if bids:
                     best = max(bids, key=lambda x: float(x['price']))
                     depth_ahead[side] = float(best['size'])
+                    best_bid[side] = float(best['price'])
 
             elif event_type == 'last_trade_price':
                 if data.get('side') != 'SELL':
                     continue
 
-                price = float(data.get('price', 0))
+                trade_price = float(data.get('price', 0))
                 size = float(data.get('size', 0))
+                our_bid = best_bid[side]
 
-                if my_capital[side] < 5:  # min order
+                if my_capital[side] < 5 or our_bid <= 0:
+                    continue
+
+                # trade must reach our bid level
+                if trade_price > our_bid + 0.02:
                     continue
 
                 # does trade sweep through to us?
                 ahead = depth_ahead[side]
                 if size > ahead:
                     available = size - ahead
-                    max_shares = my_capital[side] / price if price > 0 else 0
+                    max_shares = my_capital[side] / our_bid
                     fill = min(available, max_shares)
 
                     if fill > 0:
-                        cost = fill * price
+                        cost = fill * our_bid  # fill at OUR bid, not trade price
                         my_capital[side] -= cost
-                        my_fills[side].append((price, fill))
+                        my_fills[side].append((our_bid, fill))
                         depth_ahead[side] = 0
                 else:
                     depth_ahead[side] = max(0, ahead - size)

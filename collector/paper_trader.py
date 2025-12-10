@@ -68,42 +68,49 @@ class CoinBook:
     def edge(self):
         return 1.0 - self.combined_bid if self.combined_bid < 1 else 0
 
-    def try_fill(self, side: str, price: float, size: float) -> float:
-        """try to fill from a market SELL using queue-based model"""
+    def try_fill(self, side: str, trade_price: float, size: float) -> float:
+        """try to fill from a market SELL using queue-based model
+
+        we post at best_bid, so we fill at OUR bid price, not the trade price
+        trade just needs to sweep through our level
+        """
         # skip if no edge
         if self.combined_bid >= 1.0:
             return 0
 
         if side == 'up':
-            if self.capital_up < MIN_ORDER_SIZE:
+            our_bid = self.up_bid
+            if self.capital_up < MIN_ORDER_SIZE or our_bid <= 0:
                 return 0
-            if price > self.up_bid + 0.02:
+            # trade must be at or below our bid to reach us
+            if trade_price > our_bid + 0.02:
                 return 0
             # queue-based: only fill overflow beyond queue depth
             if size <= self.up_queue:
                 return 0
             overflow = size - self.up_queue
-            max_shares = self.capital_up / price if price > 0 else 0
+            max_shares = self.capital_up / our_bid
             fill_size = min(overflow, max_shares)
             if fill_size > 0:
-                cost = fill_size * price
+                cost = fill_size * our_bid  # fill at OUR bid, not trade price
                 self.capital_up -= cost
-                self.up_fills.append((price, fill_size))
+                self.up_fills.append((our_bid, fill_size))
             return fill_size
         else:
-            if self.capital_down < MIN_ORDER_SIZE:
+            our_bid = self.down_bid
+            if self.capital_down < MIN_ORDER_SIZE or our_bid <= 0:
                 return 0
-            if price > self.down_bid + 0.02:
+            if trade_price > our_bid + 0.02:
                 return 0
             if size <= self.down_queue:
                 return 0
             overflow = size - self.down_queue
-            max_shares = self.capital_down / price if price > 0 else 0
+            max_shares = self.capital_down / our_bid
             fill_size = min(overflow, max_shares)
             if fill_size > 0:
-                cost = fill_size * price
+                cost = fill_size * our_bid  # fill at OUR bid, not trade price
                 self.capital_down -= cost
-                self.down_fills.append((price, fill_size))
+                self.down_fills.append((our_bid, fill_size))
             return fill_size
 
     def add_market_sell(self, side: str, size: float):
