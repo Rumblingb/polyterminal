@@ -14,7 +14,7 @@ import aiohttp
 import websockets
 import clickhouse_connect
 
-from .alerts import WindowAlerts
+from alerts import WindowAlerts
 
 # endpoints
 CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
