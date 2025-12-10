@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Gabagool Paper Trader - tracks real order book, calculates edge
-BTC + ETH only
+Realistic Paper Trader - simulates actual fill rates with fixed capital
+Models competition with gabagool and other market makers
 """
 
 import asyncio
 import json
 import os
 import time
+import random
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -20,18 +21,31 @@ CLOB_WS = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-COINS = ['btc', 'eth']
+COINS = ['btc']
+
+# realistic params
+CAPITAL_PER_SIDE = 50  # $50 bid on each side per coin
+FILL_RATE = 0.10  # back of queue = best ROI per backtest
+MIN_ORDER_SIZE = 5  # minimum $5 per order like gabagool
 
 
 @dataclass
 class CoinBook:
     coin: str
+    capital_up: float = CAPITAL_PER_SIDE
+    capital_down: float = CAPITAL_PER_SIDE
     up_bid: float = 0
     up_ask: float = 1
     down_bid: float = 0
     down_ask: float = 1
+    # our simulated fills
     up_fills: list = field(default_factory=list)
     down_fills: list = field(default_factory=list)
+    # market totals (for comparison)
+    market_up_sells: float = 0
+    market_down_sells: float = 0
+    trade_count: int = 0
+    edge_samples: list = field(default_factory=list)
 
     @property
     def combined_bid(self):
@@ -41,11 +55,50 @@ class CoinBook:
     def edge(self):
         return 1.0 - self.combined_bid if self.combined_bid < 1 else 0
 
-    def add_fill(self, side: str, price: float, size: float):
+    def try_fill(self, side: str, price: float, size: float) -> float:
+        """try to fill from a market SELL, returns our fill size"""
+        # skip if no edge (combined_bid >= 1.0)
+        if self.combined_bid >= 1.0:
+            return 0
+
+        # we post at best_bid (back of queue = best ROI)
         if side == 'up':
-            self.up_fills.append((price, size))
+            if self.capital_up < MIN_ORDER_SIZE:
+                return 0
+            if price > self.up_bid + 0.02:  # only fill near our bid
+                return 0
+            our_share = size * FILL_RATE
+            max_shares = self.capital_up / price if price > 0 else 0
+            fill_size = min(our_share, max_shares)
+            if fill_size > 0:
+                cost = fill_size * price
+                self.capital_up -= cost
+                self.up_fills.append((price, fill_size))
+            return fill_size
         else:
-            self.down_fills.append((price, size))
+            if self.capital_down < MIN_ORDER_SIZE:
+                return 0
+            if price > self.down_bid + 0.02:
+                return 0
+            our_share = size * FILL_RATE
+            max_shares = self.capital_down / price if price > 0 else 0
+            fill_size = min(our_share, max_shares)
+            if fill_size > 0:
+                cost = fill_size * price
+                self.capital_down -= cost
+                self.down_fills.append((price, fill_size))
+            return fill_size
+
+    def add_market_sell(self, side: str, size: float):
+        """track total market SELL volume"""
+        if side == 'up':
+            self.market_up_sells += size
+        else:
+            self.market_down_sells += size
+
+    def sample_edge(self):
+        if self.combined_bid > 0:
+            self.edge_samples.append(self.edge)
 
     def calc_pnl(self):
         up_shares = sum(s for _, s in self.up_fills)
@@ -54,7 +107,7 @@ class CoinBook:
         down_cost = sum(p * s for p, s in self.down_fills)
 
         if up_shares == 0 or down_shares == 0:
-            return 0, 0, 0, 1.0
+            return 0, up_shares, down_shares, 1.0, up_cost + down_cost
 
         matched = min(up_shares, down_shares)
         up_avg = up_cost / up_shares
@@ -63,11 +116,14 @@ class CoinBook:
         edge = 1.0 - combined
 
         matched_pnl = matched * edge
+        # unmatched is a coin flip (EV = 0 at fair price)
         unmatched_up = max(0, up_shares - down_shares)
         unmatched_down = max(0, down_shares - up_shares)
+        # assume 50% win rate on unmatched
         unmatched_ev = unmatched_up * (0.5 - up_avg) + unmatched_down * (0.5 - down_avg)
 
-        return matched_pnl + unmatched_ev, up_shares, down_shares, combined
+        capital_used = up_cost + down_cost
+        return matched_pnl + unmatched_ev, up_shares, down_shares, combined, capital_used
 
 
 class PaperTrader:
@@ -76,10 +132,11 @@ class PaperTrader:
         self.books = {}
         self.results = []
         self.session_pnl = 0
+        self.session_capital = 0
 
     async def send_telegram(self, msg: str):
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            print(f'[tg] {msg}')
+            print(f'[tg] {msg[:100]}...')
             return
 
         try:
@@ -123,7 +180,7 @@ class PaperTrader:
 
     async def run_window(self, window_ts: int):
         window_end = window_ts + 900
-        accumulate_end = window_ts + 540
+        accumulate_end = window_ts + 540  # first 9 min
 
         dt = datetime.utcfromtimestamp(window_ts)
         print(f'\n[paper] window {dt.strftime("%H:%M")} UTC')
@@ -132,6 +189,8 @@ class PaperTrader:
 
         if not self.tokens:
             return
+
+        fills_log = []
 
         try:
             async with websockets.connect(CLOB_WS) as ws:
@@ -152,8 +211,8 @@ class PaperTrader:
                             data = data[0] if data else {}
 
                         event_type = data.get('event_type')
+                        elapsed = now - window_ts
 
-                        # track order book
                         if event_type == 'price_change':
                             for pc in data.get('price_changes', []):
                                 info = self.tokens.get(pc.get('asset_id'))
@@ -171,13 +230,9 @@ class PaperTrader:
                                     book.down_bid = float(pc.get('best_bid', 0))
                                     book.down_ask = float(pc.get('best_ask', 1))
 
-                        # track fills (SELL = retail selling to us)
-                        elif event_type == 'last_trade_price':
-                            if data.get('side') != 'SELL':
-                                continue
-                            if now >= accumulate_end:
-                                continue
+                                book.sample_edge()
 
+                        elif event_type == 'last_trade_price':
                             info = self.tokens.get(data.get('asset_id'))
                             if not info:
                                 continue
@@ -189,7 +244,18 @@ class PaperTrader:
 
                             price = float(data.get('price', 0))
                             size = float(data.get('size', 0))
-                            book.add_fill(side, price, size)
+                            trade_side = data.get('side', '')
+
+                            book.trade_count += 1
+
+                            # only try to fill on SELL trades in first 9 min
+                            if trade_side == 'SELL':
+                                book.add_market_sell(side, size)
+
+                                if now < accumulate_end:
+                                    fill = book.try_fill(side, price, size)
+                                    if fill > 0:
+                                        fills_log.append(f'{elapsed:.0f}s {coin}/{side} {fill:.1f}@${price:.2f}')
 
                     except:
                         pass
@@ -199,54 +265,82 @@ class PaperTrader:
 
         # calculate results
         total_pnl = 0
-        lines = [f'<b>📊 Window {dt.strftime("%H:%M")} UTC</b>\n']
+        total_capital = 0
+        lines = [f'<b>Window {dt.strftime("%H:%M")} UTC</b>']
+        lines.append(f'<i>Capital: ${CAPITAL_PER_SIDE}/side, Fill rate: {FILL_RATE*100:.0f}%</i>\n')
 
         for coin, book in sorted(self.books.items()):
-            pnl, up_shares, down_shares, combined = book.calc_pnl()
+            pnl, up_shares, down_shares, combined, capital = book.calc_pnl()
+            total_pnl += pnl
+            total_capital += capital
+
+            avg_edge = sum(book.edge_samples) / len(book.edge_samples) * 100 if book.edge_samples else 0
+            market_sells = book.market_up_sells + book.market_down_sells
+            our_fills = up_shares + down_shares
+            capture_rate = (our_fills / market_sells * 100) if market_sells > 0 else 0
 
             if up_shares == 0 and down_shares == 0:
-                # no fills, just show book state
-                lines.append(
-                    f'⚪ <b>{coin.upper()}</b>: no fills | '
-                    f'book ${book.combined_bid:.3f} ({book.edge*100:+.1f}%)'
-                )
+                lines.append(f'<b>{coin.upper()}</b>: no fills (mkt sells={market_sells:.0f})')
                 continue
 
-            total_pnl += pnl
-            edge = 1.0 - combined
-
-            emoji = '🟢' if pnl > 0 else '🔴' if pnl < 0 else '⚪'
+            emoji = '+' if pnl > 0 else '-' if pnl < 0 else '='
             lines.append(
                 f'{emoji} <b>{coin.upper()}</b>: '
                 f'↑{up_shares:.0f} ↓{down_shares:.0f} | '
-                f'${combined:.3f} ({edge*100:+.1f}%) | '
+                f'${capital:.0f} used | '
+                f'edge {avg_edge:+.1f}% | '
                 f'<b>${pnl:+.2f}</b>'
+            )
+            lines.append(
+                f'   mkt sells: ↑{book.market_up_sells:.0f} ↓{book.market_down_sells:.0f} | '
+                f'capture: {capture_rate:.1f}%'
             )
 
         self.session_pnl += total_pnl
-        self.results.append({'window': window_ts, 'pnl': total_pnl})
+        self.session_capital += total_capital
+        self.results.append({'window': window_ts, 'pnl': total_pnl, 'capital': total_capital})
 
-        emoji = '✅' if total_pnl > 0 else '❌' if total_pnl < 0 else '➖'
-        lines.append(f'\n{emoji} <b>Window: ${total_pnl:+.2f}</b>')
-        lines.append(f'📈 Session: ${self.session_pnl:+.2f} ({len(self.results)} windows)')
+        # summary
+        roi = (total_pnl / total_capital * 100) if total_capital > 0 else 0
+        session_roi = (self.session_pnl / self.session_capital * 100) if self.session_capital > 0 else 0
+
+        lines.append(f'\n<b>Window:</b> ${total_pnl:+.2f} on ${total_capital:.0f} ({roi:+.1f}% ROI)')
+        lines.append(f'<b>Session:</b> ${self.session_pnl:+.2f} on ${self.session_capital:.0f} ({session_roi:+.1f}% ROI)')
+        lines.append(f'<b>Windows:</b> {len(self.results)}')
 
         msg = '\n'.join(lines)
         await self.send_telegram(msg)
-        print(f'[paper] pnl=${total_pnl:+.2f} session=${self.session_pnl:+.2f}')
+        print(f'[paper] capital=${total_capital:.0f} pnl=${total_pnl:+.2f} roi={roi:+.1f}%')
 
     async def run(self):
-        print('=' * 50)
-        print('GABAGOOL PAPER TRADER')
+        print('=' * 60)
+        print('PAPER TRADER (back of queue)')
+        print(f'Capital: ${CAPITAL_PER_SIDE} per side per coin')
+        print(f'Fill rate: {FILL_RATE*100:.0f}% of market SELL flow')
         print(f'Coins: {COINS}')
-        print(f'Telegram: {"enabled" if TELEGRAM_TOKEN else "disabled"}')
-        print('=' * 50)
+        print('=' * 60)
 
-        await self.send_telegram('🚀 <b>Paper Trader Started</b>\nCoins: BTC, ETH\nFill rate: 10%')
+        startup_msg = (
+            f'<b>Paper Trader Started</b>\n'
+            f'Capital: ${CAPITAL_PER_SIDE}/side/coin\n'
+            f'Fill rate: {FILL_RATE*100:.0f}% (back of queue)\n'
+            f'Coins: {", ".join(c.upper() for c in COINS)}'
+        )
+        await self.send_telegram(startup_msg)
+
+        # on startup, join current window if in first 10 min
+        now = int(time.time())
+        current_window = now - (now % 900)
+        elapsed = now - current_window
+
+        if elapsed < 600:
+            print(f'[startup] joining current window ({elapsed}s in)')
+            await self.run_window(current_window)
 
         while True:
             now = int(time.time())
-            current = now - (now % 900)
-            next_window = current + 900
+            current_window = now - (now % 900)
+            next_window = current_window + 900
             wait = next_window - now
 
             if wait > 5:
