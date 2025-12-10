@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Realistic Paper Trader - simulates actual fill rates with fixed capital
-Models competition with gabagool and other market makers
+Paper Trader - queue-based fill simulation using websocket book events
+Posts at best_bid (back of queue), only fills when large SELLs sweep through
 """
 
 import asyncio
 import json
 import os
 import time
-import random
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -31,19 +30,25 @@ COINS = ['btc']
 
 # realistic params
 CAPITAL_PER_SIDE = 50  # $50 bid on each side per coin
-FILL_RATE = 0.10  # back of queue = best ROI per backtest
 MIN_ORDER_SIZE = 5  # minimum $5 per order like gabagool
 
 
 @dataclass
 class CoinBook:
     coin: str
+    up_token: str = ''
+    down_token: str = ''
     capital_up: float = CAPITAL_PER_SIDE
     capital_down: float = CAPITAL_PER_SIDE
     up_bid: float = 0
     up_ask: float = 1
     down_bid: float = 0
     down_ask: float = 1
+    # queue depth at best bid (from websocket book events)
+    up_queue: float = 0
+    down_queue: float = 0
+    up_queue_samples: list = field(default_factory=list)
+    down_queue_samples: list = field(default_factory=list)
     # our simulated fills
     up_fills: list = field(default_factory=list)
     down_fills: list = field(default_factory=list)
@@ -52,6 +57,8 @@ class CoinBook:
     market_down_sells: float = 0
     trade_count: int = 0
     edge_samples: list = field(default_factory=list)
+    # latency tracking (ms)
+    latency_samples: list = field(default_factory=list)
 
     @property
     def combined_bid(self):
@@ -62,20 +69,22 @@ class CoinBook:
         return 1.0 - self.combined_bid if self.combined_bid < 1 else 0
 
     def try_fill(self, side: str, price: float, size: float) -> float:
-        """try to fill from a market SELL, returns our fill size"""
-        # skip if no edge (combined_bid >= 1.0)
+        """try to fill from a market SELL using queue-based model"""
+        # skip if no edge
         if self.combined_bid >= 1.0:
             return 0
 
-        # we post at best_bid (back of queue = best ROI)
         if side == 'up':
             if self.capital_up < MIN_ORDER_SIZE:
                 return 0
-            if price > self.up_bid + 0.02:  # only fill near our bid
+            if price > self.up_bid + 0.02:
                 return 0
-            our_share = size * FILL_RATE
+            # queue-based: only fill overflow beyond queue depth
+            if size <= self.up_queue:
+                return 0
+            overflow = size - self.up_queue
             max_shares = self.capital_up / price if price > 0 else 0
-            fill_size = min(our_share, max_shares)
+            fill_size = min(overflow, max_shares)
             if fill_size > 0:
                 cost = fill_size * price
                 self.capital_up -= cost
@@ -86,9 +95,11 @@ class CoinBook:
                 return 0
             if price > self.down_bid + 0.02:
                 return 0
-            our_share = size * FILL_RATE
+            if size <= self.down_queue:
+                return 0
+            overflow = size - self.down_queue
             max_shares = self.capital_down / price if price > 0 else 0
-            fill_size = min(our_share, max_shares)
+            fill_size = min(overflow, max_shares)
             if fill_size > 0:
                 cost = fill_size * price
                 self.capital_down -= cost
@@ -338,9 +349,10 @@ class PaperTrader:
                             tokens = json.loads(tokens)
 
                         if len(tokens) >= 2:
-                            self.tokens[tokens[0]] = (coin, 'up')
-                            self.tokens[tokens[1]] = (coin, 'down')
-                            self.books[coin] = CoinBook(coin=coin)
+                            up_token, down_token = tokens[0], tokens[1]
+                            self.tokens[up_token] = (coin, 'up')
+                            self.tokens[down_token] = (coin, 'down')
+                            self.books[coin] = CoinBook(coin=coin, up_token=up_token, down_token=down_token)
 
                 except Exception as e:
                     print(f'[paper] {coin} error: {e}')
@@ -381,7 +393,39 @@ class PaperTrader:
                         event_type = data.get('event_type')
                         elapsed = now - window_ts
 
-                        if event_type == 'price_change':
+                        # calc latency from event timestamp
+                        event_ts = data.get('timestamp')
+                        if event_ts:
+                            latency_ms = (now * 1000) - int(event_ts)
+                            # get coin for this event
+                            aid = data.get('asset_id') or (data.get('price_changes', [{}])[0].get('asset_id') if data.get('price_changes') else None)
+                            if aid:
+                                info = self.tokens.get(aid)
+                                if info:
+                                    book = self.books.get(info[0])
+                                    if book:
+                                        book.latency_samples.append(latency_ms)
+
+                        if event_type == 'book':
+                            # update queue depth from book snapshot
+                            asset_id = data.get('asset_id')
+                            info = self.tokens.get(asset_id)
+                            if info:
+                                coin, side = info
+                                book = self.books.get(coin)
+                                if book:
+                                    bids = data.get('bids', [])
+                                    if bids:
+                                        best = max(bids, key=lambda x: float(x['price']))
+                                        depth = float(best['size'])
+                                        if side == 'up':
+                                            book.up_queue = depth
+                                            book.up_queue_samples.append(depth)
+                                        else:
+                                            book.down_queue = depth
+                                            book.down_queue_samples.append(depth)
+
+                        elif event_type == 'price_change':
                             for pc in data.get('price_changes', []):
                                 info = self.tokens.get(pc.get('asset_id'))
                                 if not info:
@@ -446,7 +490,7 @@ class PaperTrader:
         total_pnl = 0
         total_capital = 0
         lines = [f'<b>Window {dt.strftime("%H:%M")} UTC</b>']
-        lines.append(f'<i>Capital: ${CAPITAL_PER_SIDE}/side, Fill rate: {FILL_RATE*100:.0f}%</i>\n')
+        lines.append(f'<i>Capital: ${CAPITAL_PER_SIDE}/side, queue-based fills</i>\n')
 
         for coin, book in sorted(self.books.items()):
             pnl, up_shares, down_shares, combined, capital = book.calc_pnl()
@@ -458,8 +502,18 @@ class PaperTrader:
             our_fills = up_shares + down_shares
             capture_rate = (our_fills / market_sells * 100) if market_sells > 0 else 0
 
+            # avg queue depth
+            avg_up_q = sum(book.up_queue_samples) / len(book.up_queue_samples) if book.up_queue_samples else 0
+            avg_down_q = sum(book.down_queue_samples) / len(book.down_queue_samples) if book.down_queue_samples else 0
+
+            # latency stats
+            lat = book.latency_samples
+            avg_lat = sum(lat) / len(lat) if lat else 0
+            p50_lat = sorted(lat)[len(lat)//2] if lat else 0
+            p99_lat = sorted(lat)[int(len(lat)*0.99)] if lat else 0
+
             if up_shares == 0 and down_shares == 0:
-                lines.append(f'<b>{coin.upper()}</b>: no fills (mkt sells={market_sells:.0f})')
+                lines.append(f'<b>{coin.upper()}</b>: no fills (queue ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | lat {avg_lat:.0f}ms)')
                 continue
 
             emoji = '+' if pnl > 0 else '-' if pnl < 0 else '='
@@ -471,8 +525,8 @@ class PaperTrader:
                 f'<b>${pnl:+.2f}</b>'
             )
             lines.append(
-                f'   mkt sells: ↑{book.market_up_sells:.0f} ↓{book.market_down_sells:.0f} | '
-                f'capture: {capture_rate:.1f}%'
+                f'   queue: ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | '
+                f'lat: {p50_lat:.0f}ms p50 / {p99_lat:.0f}ms p99'
             )
 
         self.session_pnl += total_pnl
@@ -495,13 +549,19 @@ class PaperTrader:
 
         msg = '\n'.join(lines)
         await self.send_telegram(msg)
-        print(f'[paper] capital=${total_capital:.0f} pnl=${total_pnl:+.2f} roi={roi:+.1f}%')
+
+        # aggregate latency for console
+        all_lat = []
+        for book in self.books.values():
+            all_lat.extend(book.latency_samples)
+        avg_lat = sum(all_lat) / len(all_lat) if all_lat else 0
+
+        print(f'[paper] pnl=${total_pnl:+.2f} roi={roi:+.1f}% lat={avg_lat:.0f}ms')
 
     async def run(self):
         print('=' * 60)
-        print('PAPER TRADER (back of queue)')
+        print('PAPER TRADER (queue-based fills)')
         print(f'Capital: ${CAPITAL_PER_SIDE} per side per coin')
-        print(f'Fill rate: {FILL_RATE*100:.0f}% of market SELL flow')
         print(f'Coins: {COINS}')
         print('=' * 60)
 
@@ -510,7 +570,7 @@ class PaperTrader:
         startup_msg = (
             f'<b>Paper Trader Started</b>\n'
             f'Capital: ${CAPITAL_PER_SIDE}/side/coin\n'
-            f'Fill rate: {FILL_RATE*100:.0f}% (back of queue)\n'
+            f'Model: queue-based (back of queue)\n'
             f'Coins: {", ".join(c.upper() for c in COINS)}'
         )
         await self.send_telegram(startup_msg)
