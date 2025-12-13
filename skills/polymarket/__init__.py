@@ -44,13 +44,18 @@ from .clob import (
     get_combined_spread,
     estimate_fill,
     get_markets as get_clob_markets,
-    get_market as get_clob_market
+    get_market as get_clob_market,
+    get_spreads_batch,
+    get_prices_batch,
+    get_midpoints_batch
 )
 
 from .markets import (
     get_trending,
     get_active_markets,
+    list_markets,
     search_markets,
+    public_search,
     get_markets_by_category,
     get_categories,
     get_market_details,

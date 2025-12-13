@@ -2,6 +2,22 @@
 """
 Paper Trader - queue-based fill simulation using websocket book events
 Posts at best_bid (back of queue), only fills when large SELLs sweep through
+
+CRITICAL ASSUMPTIONS (read before going live):
+1. PnL only counts MATCHED fills - unmatched positions are 50/50 gambles
+2. We assume back-of-queue position (conservative)
+3. NO trading fees included - Polymarket charges ~0.5-2% depending on role
+4. Fill at our bid price, not the trade price (maker model)
+5. Queue depth from book snapshots may be stale
+6. Real latency for order placement not simulated
+7. CAPTURE_RATE models competition - we only get fraction of overflow
+   (based on backtest_passive.py analysis: 10-20% is realistic)
+
+RISKS FOR LIVE TRADING:
+- Unmatched exposure is gambling, not guaranteed profit
+- Queue position in reality depends on when you placed order
+- Book can move against you between signal and order placement
+- Network issues can cause missed fills or duplicate orders
 """
 
 import asyncio
@@ -31,6 +47,12 @@ COINS = ['btc']
 # realistic params
 CAPITAL_PER_SIDE = 50  # $50 bid on each side per coin
 MIN_ORDER_SIZE = 5  # minimum $5 per order like gabagool
+MAX_IMBALANCE_RATIO = 3.0  # max imbalance: don't let one side exceed 3x the other
+# e.g., if we have 100 UP shares, don't accumulate more than 300 DOWN shares
+
+# capture rate: what fraction of overflow we actually get
+# based on backtest analysis, 10-20% is realistic given competition
+CAPTURE_RATE = 0.15  # 15% of available flow
 
 
 @dataclass
@@ -78,19 +100,28 @@ class CoinBook:
         if self.combined_bid >= 1.0:
             return 0
 
+        # calculate current fill totals
+        up_shares = sum(s for _, s in self.up_fills)
+        down_shares = sum(s for _, s in self.down_fills)
+
         if side == 'up':
             our_bid = self.up_bid
             if self.capital_up < MIN_ORDER_SIZE or our_bid <= 0:
                 return 0
+            # check imbalance limit - don't let one side get too far ahead
+            if down_shares > 0 and up_shares >= down_shares * MAX_IMBALANCE_RATIO:
+                return 0  # UP side too far ahead, skip fill
             # trade must be at or below our bid to reach us
             if trade_price > our_bid + 0.02:
                 return 0
-            # queue-based: only fill overflow beyond queue depth
+            # queue-based: only fill fraction of overflow beyond queue depth
+            # apply capture rate to simulate competition from other MMs
             if size <= self.up_queue:
                 return 0
             overflow = size - self.up_queue
+            available = overflow * CAPTURE_RATE  # we only get a fraction
             max_shares = self.capital_up / our_bid
-            fill_size = min(overflow, max_shares)
+            fill_size = min(available, max_shares)
             if fill_size > 0:
                 cost = fill_size * our_bid  # fill at OUR bid, not trade price
                 self.capital_up -= cost
@@ -100,13 +131,18 @@ class CoinBook:
             our_bid = self.down_bid
             if self.capital_down < MIN_ORDER_SIZE or our_bid <= 0:
                 return 0
+            # check imbalance limit
+            if up_shares > 0 and down_shares >= up_shares * MAX_IMBALANCE_RATIO:
+                return 0  # DOWN side too far ahead, skip fill
             if trade_price > our_bid + 0.02:
                 return 0
+            # queue-based: only fill fraction of overflow
             if size <= self.down_queue:
                 return 0
             overflow = size - self.down_queue
+            available = overflow * CAPTURE_RATE  # we only get a fraction
             max_shares = self.capital_down / our_bid
-            fill_size = min(overflow, max_shares)
+            fill_size = min(available, max_shares)
             if fill_size > 0:
                 cost = fill_size * our_bid  # fill at OUR bid, not trade price
                 self.capital_down -= cost
@@ -125,6 +161,11 @@ class CoinBook:
             self.edge_samples.append(self.edge)
 
     def calc_pnl(self):
+        """calculate REALISTIC pnl - only matched fills count as guaranteed profit
+
+        WARNING: unmatched fills are NOT profit - they're 50/50 gambles on the outcome.
+        we track them separately but do NOT include in pnl.
+        """
         up_shares = sum(s for _, s in self.up_fills)
         down_shares = sum(s for _, s in self.down_fills)
         up_cost = sum(p * s for p, s in self.up_fills)
@@ -139,15 +180,16 @@ class CoinBook:
         combined = up_avg + down_avg
         edge = 1.0 - combined
 
+        # ONLY count matched fills as profit - this is guaranteed money
         matched_pnl = matched * edge
-        # unmatched is a coin flip (EV = 0 at fair price)
-        unmatched_up = max(0, up_shares - down_shares)
-        unmatched_down = max(0, down_shares - up_shares)
-        # assume 50% win rate on unmatched
-        unmatched_ev = unmatched_up * (0.5 - up_avg) + unmatched_down * (0.5 - down_avg)
+
+        # track unmatched exposure (for reporting only - NOT profit)
+        self.unmatched_up = max(0, up_shares - down_shares)
+        self.unmatched_down = max(0, down_shares - up_shares)
+        self.unmatched_exposure = self.unmatched_up * up_avg + self.unmatched_down * down_avg
 
         capital_used = up_cost + down_cost
-        return matched_pnl + unmatched_ev, up_shares, down_shares, combined, capital_used
+        return matched_pnl, up_shares, down_shares, combined, capital_used
 
 
 class PaperTrader:
@@ -415,6 +457,8 @@ class PaperTrader:
 
                         if event_type == 'book':
                             # update queue depth from book snapshot
+                            # NOTE: this only captures size at best bid, not total queue
+                            # real queue could be larger if multiple orders at same price
                             asset_id = data.get('asset_id')
                             info = self.tokens.get(asset_id)
                             if info:
@@ -425,6 +469,8 @@ class PaperTrader:
                                     if bids:
                                         best = max(bids, key=lambda x: float(x['price']))
                                         depth = float(best['size'])
+                                        # add 20% safety margin - queue is likely larger than snapshot
+                                        depth = depth * 1.2
                                         if side == 'up':
                                             book.up_queue = depth
                                             book.up_queue_samples.append(depth)
@@ -523,14 +569,21 @@ class PaperTrader:
                 lines.append(f'<b>{coin.upper()}</b>: no fills (queue ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | lat {avg_lat:.0f}ms)')
                 continue
 
+            matched = min(up_shares, down_shares)
             emoji = '+' if pnl > 0 else '-' if pnl < 0 else '='
             lines.append(
                 f'{emoji} <b>{coin.upper()}</b>: '
-                f'↑{up_shares:.0f} ↓{down_shares:.0f} | '
-                f'${capital:.0f} used | '
+                f'↑{up_shares:.0f} ↓{down_shares:.0f} (matched: {matched:.0f}) | '
                 f'edge {avg_edge:+.1f}% | '
                 f'<b>${pnl:+.2f}</b>'
             )
+            # warn about unmatched exposure
+            unmatched = abs(up_shares - down_shares)
+            if unmatched > 0:
+                exposure = getattr(book, 'unmatched_exposure', 0)
+                lines.append(
+                    f'   ⚠️ UNMATCHED: {unmatched:.0f} shares (${exposure:.0f} at risk - 50/50 gamble)'
+                )
             lines.append(
                 f'   queue: ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | '
                 f'lat: {p50_lat:.0f}ms p50 / {p99_lat:.0f}ms p99'
@@ -546,12 +599,12 @@ class PaperTrader:
         for coin, book in self.books.items():
             self.store_window(window_ts, coin, book)
 
-        # summary
+        # summary - MATCHED ONLY (guaranteed profit)
         roi = (total_pnl / total_capital * 100) if total_capital > 0 else 0
         session_roi = (self.session_pnl / self.session_capital * 100) if self.session_capital > 0 else 0
 
-        lines.append(f'\n<b>Window:</b> ${total_pnl:+.2f} on ${total_capital:.0f} ({roi:+.1f}% ROI)')
-        lines.append(f'<b>Session:</b> ${self.session_pnl:+.2f} on ${self.session_capital:.0f} ({session_roi:+.1f}% ROI)')
+        lines.append(f'\n<b>Window PnL (matched only):</b> ${total_pnl:+.2f}')
+        lines.append(f'<b>Session PnL (matched only):</b> ${self.session_pnl:+.2f}')
         lines.append(f'<b>Windows:</b> {len(self.results)}')
 
         msg = '\n'.join(lines)
@@ -569,6 +622,7 @@ class PaperTrader:
         print('=' * 60)
         print('PAPER TRADER (queue-based fills)')
         print(f'Capital: ${CAPITAL_PER_SIDE} per side per coin')
+        print(f'Capture rate: {CAPTURE_RATE*100:.0f}% of overflow')
         print(f'Coins: {COINS}')
         print('=' * 60)
 
@@ -578,6 +632,8 @@ class PaperTrader:
             f'<b>Paper Trader Started</b>\n'
             f'Capital: ${CAPITAL_PER_SIDE}/side/coin\n'
             f'Model: queue-based (back of queue)\n'
+            f'Capture rate: {CAPTURE_RATE*100:.0f}% of overflow\n'
+            f'PnL: MATCHED ONLY (realistic)\n'
             f'Coins: {", ".join(c.upper() for c in COINS)}'
         )
         await self.send_telegram(startup_msg)

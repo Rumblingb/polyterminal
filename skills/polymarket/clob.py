@@ -161,6 +161,67 @@ def get_midpoint(token_id: str) -> Optional[float]:
     spread = get_spread(token_id)
     return spread['mid'] if spread else None
 
+def get_spreads_batch(token_ids: list) -> dict:
+    """
+    get spreads for multiple tokens in one request
+
+    args:
+        token_ids: list of token IDs (max 500)
+
+    returns dict: {token_id: spread_value, ...}
+    """
+    if not token_ids:
+        return {}
+
+    payload = [{'token_id': tid} for tid in token_ids[:500]]
+
+    resp = requests.post(f"{CLOB_API_BASE}/spreads",
+                        json=payload,
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_prices_batch(token_ids: list, side: str = 'buy') -> dict:
+    """
+    get prices for multiple tokens in one request
+
+    args:
+        token_ids: list of token IDs (max 500)
+        side: 'buy' or 'sell'
+
+    returns dict: {token_id: price, ...}
+    """
+    if not token_ids:
+        return {}
+
+    payload = [{'token_id': tid, 'side': side.upper()} for tid in token_ids[:500]]
+
+    resp = requests.post(f"{CLOB_API_BASE}/prices",
+                        json=payload,
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_midpoints_batch(token_ids: list) -> dict:
+    """
+    get midpoints for multiple tokens in one request
+
+    args:
+        token_ids: list of token IDs (max 500)
+
+    returns dict: {token_id: midpoint, ...}
+    """
+    if not token_ids:
+        return {}
+
+    payload = [{'token_id': tid} for tid in token_ids[:500]]
+
+    resp = requests.post(f"{CLOB_API_BASE}/midpoints",
+                        json=payload,
+                        timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
 def get_combined_spread(up_token: str, down_token: str) -> Optional[dict]:
     """
     get combined spread for up/down token pair

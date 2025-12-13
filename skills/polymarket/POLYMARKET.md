@@ -1,461 +1,564 @@
 # Polymarket API Reference
 
-Skills for querying Polymarket on-chain and off-chain data.
+Skills for querying and trading on Polymarket.
+
+## API Endpoints
+
+| API | Base URL | Auth |
+|-----|----------|------|
+| CLOB | `https://clob.polymarket.com` | L1/L2 for trading |
+| Gamma | `https://gamma-api.polymarket.com` | None |
+| Data API | `https://data-api.polymarket.com` | None |
+| Subgraph | `https://api.goldsky.com/.../orderbook-subgraph/0.0.1/gn` | None |
 
 ## Data Sources Overview
 
-| Source | Type | Use Case | Latency | Limit |
-|--------|------|----------|---------|-------|
-| **Goldsky Subgraph** | GraphQL | Historical wallet trades (source of truth) | ~1-5s | 1000/query |
-| **Data API** | REST | Enriched trades with market metadata | ~5s | 500/query |
-| **Gamma API** | REST | Market metadata, token mapping | ~1-3s | - |
-| **CLOB API** | REST | Orderbook, prices | ~1-3s | - |
+| Source | Type | Use Case | Latency |
+|--------|------|----------|---------|
+| **Goldsky Subgraph** | GraphQL | Historical wallet trades (source of truth) | ~1-5s |
+| **Data API** | REST | Enriched trades with market metadata | ~5s |
+| **Gamma API** | REST | Market metadata, token mapping, search | ~1-3s |
+| **CLOB API** | REST/WS | Orderbook, prices, order placement | ~1-3s |
 
 ---
 
-## Modules
+# CLOB Trading System
 
-### subgraph.py - On-Chain Trade Data (Source of Truth)
+The CLOB (Central Limit Order Book) is hybrid-decentralized: off-chain matching with on-chain settlement via the Exchange contract.
 
-Queries the Goldsky subgraph which indexes Polymarket smart contracts.
+## Authentication
+
+### Signature Types
+
+| Type | ID | Description | Funder |
+|------|----|-------------|--------|
+| EOA | 0 | Standard wallet (MetaMask) | EOA address, needs POL for gas |
+| POLY_PROXY | 1 | Magic Link email/Google login | Proxy wallet from Polymarket.com |
+| GNOSIS_SAFE | 2 | Browser wallet proxy (most common) | Deployed Safe proxy wallet |
+
+### L1 Authentication (Private Key)
+
+Signs EIP-712 messages to prove wallet ownership. Used to create/derive API keys.
+
+**Headers:**
+```
+POLY_ADDRESS:   Polygon signer address
+POLY_SIGNATURE: EIP-712 signature
+POLY_TIMESTAMP: Unix timestamp
+POLY_NONCE:     Nonce (default 0)
+```
+
+**Endpoints:**
+```
+POST /auth/api-key        # create new API credentials
+GET  /auth/derive-api-key # derive existing credentials
+```
+
+**Response:**
+```json
+{
+  "apiKey": "550e8400-e29b-41d4-a716-446655440000",
+  "secret": "base64EncodedSecretString",
+  "passphrase": "randomPassphraseString"
+}
+```
+
+### L2 Authentication (API Key)
+
+HMAC-SHA256 signed requests for trading operations.
+
+**Headers:**
+```
+POLY_ADDRESS:    Polygon signer address
+POLY_SIGNATURE:  HMAC signature
+POLY_TIMESTAMP:  Unix timestamp
+POLY_API_KEY:    API key
+POLY_PASSPHRASE: Passphrase
+```
+
+### Python Client Setup
+
+```python
+from py_clob_client.client import ClobClient
+
+host = "https://clob.polymarket.com"
+key = "0x..."  # private key
+chain_id = 137
+
+# for browser wallet users (signature_type=2)
+client = ClobClient(host, key=key, chain_id=chain_id,
+                    signature_type=2, funder=PROXY_ADDRESS)
+
+# get/create API credentials
+client.set_api_creds(client.create_or_derive_api_creds())
+```
+
+---
+
+## Orders
+
+### Order Types
+
+| Type | Description |
+|------|-------------|
+| **GTC** | Good-Til-Cancelled. Limit order active until filled or cancelled |
+| **GTD** | Good-Til-Date. Active until specified UTC timestamp (add 60s security threshold) |
+| **FOK** | Fill-Or-Kill. Market order must fill entirely or cancel |
+| **FAK** | Fill-And-Kill. Market order fills what's available, cancels rest |
+
+### Place Single Order
+
+```
+POST /order
+```
+
+**Payload:**
+```json
+{
+  "order": {
+    "salt": 660377097,
+    "maker": "0x...",
+    "signer": "0x...",
+    "taker": "0x0000000000000000000000000000000000000000",
+    "tokenId": "88613172...",
+    "makerAmount": "50000",
+    "takerAmount": "5000000",
+    "expiration": "0",
+    "nonce": "0",
+    "feeRateBps": "0",
+    "side": "BUY",
+    "signatureType": 0,
+    "signature": "0x..."
+  },
+  "owner": "api_key",
+  "orderType": "GTC"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "errorMsg": "",
+  "orderID": "0x...",
+  "transactionHashes": ["0x..."],
+  "status": "live",
+  "takingAmount": "50000",
+  "makingAmount": "5000000"
+}
+```
+
+**Order Statuses:**
+- `matched` - placed and matched with resting order
+- `live` - resting on book
+- `delayed` - marketable but delayed
+- `unmatched` - marketable but delay failed
+
+### Place Multiple Orders (Batch)
+
+```
+POST /orders
+```
+
+Max 15 orders per batch.
+
+```python
+from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
+
+resp = client.post_orders([
+    PostOrdersArgs(
+        order=client.create_order(OrderArgs(
+            price=0.50, size=100, side=BUY, token_id="..."
+        )),
+        orderType=OrderType.GTC,
+    ),
+    PostOrdersArgs(
+        order=client.create_order(OrderArgs(
+            price=0.45, size=100, side=BUY, token_id="..."
+        )),
+        orderType=OrderType.GTC,
+    )
+])
+```
+
+### Get Order
+
+```
+GET /data/order/<order_hash>
+```
+
+**Response:**
+```json
+{
+  "id": "0x...",
+  "status": "LIVE",
+  "owner": "api_key",
+  "maker_address": "0x...",
+  "market": "0x...",
+  "asset_id": "61923...",
+  "side": "BUY",
+  "original_size": "100",
+  "size_matched": "0",
+  "price": "0.50",
+  "associate_trades": [],
+  "outcome": "Yes",
+  "created_at": 1702345678,
+  "expiration": "0",
+  "order_type": "GTC"
+}
+```
+
+### Get Active Orders
+
+```
+GET /data/orders
+```
+
+**Query params:** `id`, `market`, `asset_id`
+
+### Cancel Orders
+
+```bash
+DELETE /order              # single order: {"orderID": "0x..."}
+DELETE /orders             # multiple: ["0x...", "0x..."]
+DELETE /cancel-all         # all orders
+DELETE /cancel-market-orders  # by market: {"market": "0x...", "asset_id": "..."}
+```
+
+**Response:**
+```json
+{
+  "canceled": ["0x..."],
+  "not_canceled": {}
+}
+```
+
+### Order Reward Scoring
+
+```
+GET /order-scoring?order_id=0x...
+POST /orders-scoring  # batch: {"orderIds": ["0x..."]}
+```
+
+### Order Errors
+
+| Error | Description |
+|-------|-------------|
+| INVALID_ORDER_MIN_TICK_SIZE | Price breaks tick size rules |
+| INVALID_ORDER_MIN_SIZE | Size below minimum |
+| INVALID_ORDER_DUPLICATED | Same order already placed |
+| INVALID_ORDER_NOT_ENOUGH_BALANCE | Insufficient balance/allowance |
+| INVALID_ORDER_EXPIRATION | Expiration in the past |
+| FOK_ORDER_NOT_FILLED_ERROR | FOK order couldn't fill completely |
+
+---
+
+## Trades
+
+### Get Trades (L2 Required)
+
+```
+GET /data/trades
+```
+
+**Query params:** `id`, `taker`, `maker`, `market`, `before`, `after`
+
+**Trade Statuses:**
+| Status | Terminal | Description |
+|--------|----------|-------------|
+| MATCHED | no | Sent to executor |
+| MINED | no | Mined, no finality |
+| CONFIRMED | yes | Finalized, successful |
+| RETRYING | no | Failed, being retried |
+| FAILED | yes | Failed permanently |
+
+**Response:**
+```json
+{
+  "id": "...",
+  "taker_order_id": "0x...",
+  "market": "0x...",
+  "asset_id": "61923...",
+  "side": "BUY",
+  "size": "100",
+  "fee_rate_bps": "0",
+  "price": "0.50",
+  "status": "CONFIRMED",
+  "match_time": "1702345678",
+  "outcome": "Yes",
+  "transaction_hash": "0x...",
+  "trader_side": "TAKER",
+  "maker_orders": [
+    {
+      "order_id": "0x...",
+      "matched_amount": "100",
+      "price": "0.50",
+      "side": "SELL"
+    }
+  ]
+}
+```
+
+---
+
+## Orderbook & Pricing
+
+### Get Orderbook
+
+```
+GET /book?token_id=...
+```
+
+```json
+{
+  "market": "0x...",
+  "asset_id": "61923...",
+  "timestamp": "1702345678000",
+  "bids": [{"price": "0.48", "size": "500"}],
+  "asks": [{"price": "0.52", "size": "400"}]
+}
+```
+
+### Get Price
+
+```
+GET /price?token_id=...&side=buy
+```
+
+### Get Midpoint
+
+```
+GET /midpoint?token_id=...
+```
+
+### Batch Spreads
+
+```
+POST /spreads
+```
+
+```json
+[{"token_id": "123..."}, {"token_id": "456..."}]
+```
+
+**Response:**
+```json
+{"123...": "0.04", "456...": "0.02"}
+```
+
+### Price History
+
+```
+GET /prices-history?market=0x...&interval=1h&fidelity=1
+```
+
+---
+
+## Fees
+
+Currently 0 bps for both maker and taker.
+
+Fee calculation:
+- **Selling:** `fee = baseRate * min(price, 1-price) * size`
+- **Buying:** `fee = baseRate * min(price, 1-price) * size / price`
+
+---
+
+# Gamma API (Markets)
+
+## Search
+
+```
+GET /public-search?q=bitcoin
+```
+
+**Query params:**
+- `q` (required) - search query
+- `limit_per_type` - results per type
+- `events_status` - filter status
+- `search_profiles` - include profiles
+
+**Response:**
+```json
+{
+  "events": [...],
+  "tags": [...],
+  "profiles": [...],
+  "pagination": {}
+}
+```
+
+## List Markets
+
+```
+GET /markets
+```
+
+**Query params:**
+| Param | Type | Description |
+|-------|------|-------------|
+| limit | int | max results |
+| offset | int | pagination |
+| order | string | sort field (volume24hr, liquidity, etc) |
+| ascending | bool | sort direction |
+| slug | string[] | filter by slugs |
+| clob_token_ids | string[] | filter by tokens |
+| condition_ids | string[] | filter by conditions |
+| active | bool | active only |
+| closed | bool | closed only |
+| tag_id | int | category filter |
+
+**Response fields:**
+```json
+{
+  "id": "900298",
+  "question": "Will Bitcoin hit $100k?",
+  "conditionId": "0x...",
+  "slug": "bitcoin-100k",
+  "outcomes": "[\"Yes\", \"No\"]",
+  "outcomePrices": "[\"0.65\", \"0.35\"]",
+  "clobTokenIds": "[\"123...\", \"456...\"]",
+  "volume": "1500000",
+  "volume24hr": 50000,
+  "liquidity": "250000",
+  "active": true,
+  "closed": false,
+  "endDate": "2024-12-31T00:00:00Z",
+  "bestBid": 0.64,
+  "bestAsk": 0.66,
+  "lastTradePrice": 0.65
+}
+```
+
+## Events
+
+```
+GET /events           # list events
+GET /events/<id>      # by id
+GET /events?slug=...  # by slug
+```
+
+## Tags
+
+```
+GET /tags             # all tags
+GET /tags/<id>        # by id
+```
+
+---
+
+# Data API
+
+## Trades
+
+```
+GET /trades?proxyWallet=0x...&limit=100
+```
+
+**Response:**
+```json
+{
+  "proxyWallet": "0x...",
+  "side": "BUY",
+  "asset": "61923...",
+  "conditionId": "0x...",
+  "size": 100.0,
+  "price": 0.65,
+  "timestamp": 1702345678,
+  "title": "Bitcoin to $100k",
+  "slug": "bitcoin-100k",
+  "outcome": "Yes",
+  "transactionHash": "0x..."
+}
+```
+
+## Positions
+
+```
+GET /positions?user=0x...
+```
+
+## Activity
+
+```
+GET /activity?user=0x...
+```
+
+---
+
+# Subgraph (On-Chain Truth)
 
 ```
 URL: https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn
 ```
 
-#### Functions
+## Query Trades
 
-```python
-from subgraph import get_wallet_trades, decode_trade, count_wallet_trades
-
-# fetch trades for a wallet
-trades = get_wallet_trades(
-    wallet='0x6031...',
-    limit=100,          # max 1000
-    skip=0,             # pagination offset
-    role='both',        # 'maker', 'taker', or 'both'
-    since_ts=1234567    # unix timestamp filter
-)
-
-# decode raw event into readable trade
-decoded = decode_trade(raw_event, wallet)
-# returns: {tx, timestamp, role, side, shares, price, usdc, fee, token_id}
-
-# quick trade count
-counts = count_wallet_trades(wallet)
-# returns: {maker: N, taker: N, total: N}
-
-# get ALL trades (paginated)
-all_trades = get_wallet_trades_all(wallet, role='both')
-
-# trades by token
-token_trades = get_trades_by_token(token_id, limit=100)
-
-# recent global trades
-recent = get_recent_trades(limit=50)
-```
-
-#### Raw Event Structure
-
-```json
+```graphql
 {
-  "id": "0x123..._0xabc...",
-  "timestamp": "1765345143",
-  "transactionHash": "0x...",
-  "orderHash": "0x...",
-  "maker": "0x...",
-  "taker": "0x...",
-  "makerAssetId": "0",
-  "takerAssetId": "61923092...",
-  "makerAmountFilled": "3180000",
-  "takerAmountFilled": "6000000",
-  "fee": "0"
+  orderFilledEvents(
+    where: {maker: "0x..."}
+    orderBy: timestamp
+    orderDirection: desc
+    first: 100
+  ) {
+    id
+    timestamp
+    transactionHash
+    orderHash
+    maker
+    taker
+    makerAssetId
+    takerAssetId
+    makerAmountFilled
+    takerAmountFilled
+    fee
+  }
 }
 ```
 
-#### Trade Decoding Logic
+## Trade Decoding
 
 ```
 Asset ID "0" = USDC
-Asset ID != "0" = Conditional token (outcome)
+Asset ID != "0" = Conditional token
 
-Amounts are in 6 decimal units (divide by 1e6)
+Amounts in 6 decimals (divide by 1e6)
 
-If wallet is MAKER:
+MAKER:
   makerAssetId == "0" → BUY (sent USDC, got tokens)
   makerAssetId != "0" → SELL (sent tokens, got USDC)
 
-If wallet is TAKER:
+TAKER:
   takerAssetId == "0" → BUY
   takerAssetId != "0" → SELL
 
 Price = usdc_amount / shares_amount
 ```
 
-#### CLI
-
-```bash
-python subgraph.py trades <wallet> [--limit N] [--role maker|taker]
-python subgraph.py count <wallet>
-python subgraph.py recent [--limit N]
-python subgraph.py token <token_id> [--limit N]
-```
-
 ---
 
-### data_api.py - Enriched Trade Data
+# Smart Contracts
 
-Pre-decoded trades with market metadata. Easier but may miss historical data.
+## Addresses (Polygon)
 
-```
-URL: https://data-api.polymarket.com/trades
-```
+| Contract | Address |
+|----------|---------|
+| CTF Exchange | `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` |
+| NegRisk CTF | `0xC5d563A36AE78145C45a50134d48A1215220f80a` |
+| USDC | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` |
 
-#### Functions
-
-```python
-from data_api import get_trades, get_wallet_trades, summarize_trades
-
-# recent trades
-trades = get_trades(limit=100, offset=0, market=None, asset_id=None)
-
-# wallet trades
-trades = get_wallet_trades(wallet, limit=100, offset=0, role='both')
-
-# all wallet trades (paginated)
-all_trades = get_wallet_trades_all(wallet, max_trades=5000)
-
-# trades by market
-trades = get_market_trades(condition_id, limit=100)
-
-# trades by token
-trades = get_token_trades(token_id, limit=100)
-
-# summarize trades
-summary = summarize_trades(trades)
-# returns: {count, total_volume_usdc, buy_count, sell_count, ...}
-```
-
-#### Response Structure
-
-```json
-{
-  "proxyWallet": "0x...",
-  "side": "BUY",
-  "asset": "61923092...",
-  "conditionId": "0x...",
-  "size": 14.0,
-  "price": 0.83,
-  "timestamp": 1765345313,
-  "title": "Bitcoin Up or Down - December 10...",
-  "slug": "btc-updown-15m-1765344600",
-  "outcome": "Up",
-  "outcomeIndex": 0,
-  "transactionHash": "0x...",
-  "name": "gabagool22",
-  "pseudonym": "Grown-Cantaloupe"
-}
-```
-
-#### CLI
-
-```bash
-python data_api.py recent [--limit N]
-python data_api.py wallet <address> [--limit N]
-python data_api.py market <condition_id> [--limit N]
-python data_api.py summary <address>
-```
-
----
-
-### gamma.py - Market Metadata
-
-Map token IDs to markets, get market details, find active markets.
-
-```
-URL: https://gamma-api.polymarket.com
-```
-
-#### Functions
-
-```python
-from gamma import get_market_by_token, get_token_info, find_markets
-
-# map token to market (includes outcome detection)
-market = get_market_by_token(token_id)
-# adds: market['outcome'], market['outcome_index']
-
-# get full token info
-info = get_token_info(token_id)
-# returns: {token_id, market, slug, outcome, current_price, condition_id, counterpart_token_id}
-
-# batch lookup
-infos = batch_token_info([token_id1, token_id2])
-
-# get market by slug
-market = get_market_by_slug('btc-updown-15m-1765344600')
-
-# get market by condition
-market = get_market_by_condition('0xa69a5bbd...')
-
-# find markets
-markets = find_markets(
-    slug_contains='updown-15m',
-    active=True,
-    closed=False,
-    limit=50
-)
-
-# find events (market groups)
-events = find_events(slug_contains='updown', active=True)
-
-# get 15m updown markets
-markets = get_15m_updown_markets(coin='btc')
-```
-
-#### Market Structure
-
-```json
-{
-  "id": "900298",
-  "question": "Bitcoin Up or Down - December 10...",
-  "conditionId": "0xa69a5bbd...",
-  "slug": "btc-updown-15m-1765344600",
-  "outcomes": "[\"Up\", \"Down\"]",
-  "outcomePrices": "[\"0.495\", \"0.505\"]",
-  "clobTokenIds": "[\"61923092...\", \"27239269...\"]",
-  "volume": "60492.32",
-  "liquidity": "16575.02",
-  "active": true,
-  "closed": false,
-  "resolutionSource": "https://data.chain.link/streams/btc-usd"
-}
-```
-
-#### Token ID ↔ Outcome Mapping
-
-```python
-outcomes = json.loads(market['outcomes'])        # ["Up", "Down"]
-token_ids = json.loads(market['clobTokenIds'])   # ["61923...", "27239..."]
-
-# token_ids[0] → outcomes[0] (Up)
-# token_ids[1] → outcomes[1] (Down)
-```
-
-#### CLI
-
-```bash
-python gamma.py token <token_id>
-python gamma.py slug <slug>
-python gamma.py find [--slug-contains X] [--limit N]
-python gamma.py 15m [--coin btc]
-```
-
----
-
-### clob.py - Orderbook & Pricing
-
-Live orderbook snapshots and pricing.
-
-```
-URL: https://clob.polymarket.com
-```
-
-#### Functions
-
-```python
-from clob import get_book, get_price, get_spread, get_depth
-
-# full orderbook
-book = get_book(token_id)
-# returns: {market, asset_id, timestamp, bids: [{price, size}], asks: [...]}
-
-# best price
-price = get_price(token_id, side='buy')  # or 'sell'
-
-# bid/ask spread
-spread = get_spread(token_id)
-# returns: {bid, ask, spread, spread_pct, mid, bid_size, ask_size}
-
-# orderbook depth
-depth = get_depth(token_id, levels=5)
-# returns: {bids, asks, total_bid_depth, total_ask_depth}
-
-# combined spread for up/down pair (edge calculation)
-edge = get_combined_spread(up_token, down_token)
-# returns: {up_bid, down_bid, combined, edge, edge_pct}
-
-# estimate fill for order
-est = estimate_fill(token_id, side='buy', size=100)
-# returns: {avg_price, total_cost, slippage_pct, levels_consumed}
-
-# list markets
-result = get_markets(limit=100, cursor=None)
-
-# single market
-market = get_market(condition_id)
-```
-
-#### Orderbook Structure
-
-```json
-{
-  "market": "0xa69a5bbd...",
-  "asset_id": "61923092...",
-  "timestamp": "1765345129933",
-  "bids": [
-    {"price": "0.48", "size": "500"},
-    {"price": "0.47", "size": "300"}
-  ],
-  "asks": [
-    {"price": "0.52", "size": "400"},
-    {"price": "0.53", "size": "200"}
-  ]
-}
-```
-
-#### CLI
-
-```bash
-python clob.py book <token_id>
-python clob.py price <token_id> [--side buy|sell]
-python clob.py spread <token_id>
-python clob.py depth <token_id> [--levels N]
-python clob.py estimate <token_id> <side> <size>
-python clob.py markets [--limit N]
-```
-
----
-
-### markets.py - Market Discovery & Search
-
-Find markets by volume, category, search. Get market details and summaries.
-
-#### Functions
-
-```python
-from markets import get_trending, search_markets, get_market_details
-
-# top markets by 24h volume
-trending = get_trending(limit=20, timeframe='24hr')
-# timeframe: '24hr', '1wk', '1mo', '1yr'
-
-# search markets
-results = search_markets('bitcoin', limit=10, active_only=True)
-
-# get active markets
-active = get_active_markets(limit=50, offset=0)
-
-# get markets by category
-sports = get_markets_by_category('Sports', limit=20)
-
-# list all categories
-categories = get_categories()
-
-# get market details (full info)
-market = get_market_details(slug='fed-rate-hike-in-2025')
-market = get_market_details(condition_id='0xa69a...')
-
-# get event (group of markets)
-event = get_event(slug='fed-rate-hike-in-2025')
-
-# list events
-events = get_events(active=True, limit=20)
-
-# get 15m updown markets
-markets = get_15m_markets(coin='btc')
-
-# get current 15m window for all coins
-windows = get_current_15m_window()
-# returns: {'btc': {...}, 'eth': {...}, 'sol': {...}, 'xrp': {...}}
-
-# get full market summary with orderbook data
-summary = get_market_summary(slug='fed-rate-hike-in-2025')
-
-# get price history (from CLOB)
-history = get_price_history(condition_id, interval='1h', fidelity=1)
-```
-
-#### CLI
-
-```bash
-python markets.py trending [--limit N]
-python markets.py search <query> [--limit N]
-python markets.py categories
-python markets.py category <name> [--limit N]
-python markets.py details <slug>
-python markets.py event <slug>
-python markets.py active [--limit N]
-python markets.py 15m [--coin btc]
-```
-
----
-
-### wallet.py - Wallet Analysis
-
-High-level wallet analysis combining all data sources.
-
-#### Functions
-
-```python
-from wallet import analyze_wallet, get_positions, get_pnl, get_activity
-
-# full analysis
-analysis = analyze_wallet(wallet, limit=500)
-# returns: {address, trade_counts, activity_24h, positions, pnl}
-
-# decoded trades with market info
-trades = get_decoded_trades(wallet, limit=500, since_ts=None)
-
-# current open positions
-positions = get_positions(wallet, limit=1000)
-# returns: {token_id: {shares, avg_entry, market, outcome, current_price, unrealized_pnl}}
-
-# realized P&L
-pnl = get_pnl(wallet, limit=1000)
-# returns: {total_pnl, total_volume, win_rate, by_market}
-
-# recent activity
-activity = get_activity(wallet, hours=24)
-# returns: {trades_count, volume, buys, sells, unique_markets, hourly_breakdown}
-```
-
-#### CLI
-
-```bash
-python wallet.py analyze <address>
-python wallet.py trades <address> [--limit N]
-python wallet.py positions <address>
-python wallet.py pnl <address>
-python wallet.py activity <address> [--hours N]
-```
-
----
-
-## Smart Contracts
-
-### CTF Exchange (main)
-```
-Address: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
-```
-
-### NegRisk CTF
-```
-Address: 0xC5d563A36AE78145C45a50134d48A1215220f80a
-```
-
-### OrderFilled Event
+## OrderFilled Event
 
 ```
 Topic: 0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6
 
-Indexed (topics):
-  [0] event signature
+Indexed:
   [1] orderHash
-  [2] maker address
-  [3] taker address
+  [2] maker
+  [3] taker
 
-Data (non-indexed):
+Data:
   bytes 0-31:   makerAssetId
   bytes 32-63:  takerAssetId
   bytes 64-95:  makerAmountFilled
@@ -465,131 +568,156 @@ Data (non-indexed):
 
 ---
 
-## Known Wallets
+# WebSockets
 
-| Name | Address | Notes |
-|------|---------|-------|
-| Gabagool | `0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d` | Major market maker |
-| Sharky | `0x751a2b86cab503496efd325c8344e10159349ea1` | Active trader |
+## CLOB (Orderbook)
 
----
-
-## WebSocket Endpoints
-
-### CLOB WebSocket (orderbook updates)
 ```
-URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
-Subscribe: {"assets_ids": ["token_id1", ...], "type": "market"}
+wss://ws-subscriptions-clob.polymarket.com/ws/market
 
-Events:
-- book: full orderbook snapshot
-- price_change: best bid/ask updates
-- last_trade_price: executed trade
+Subscribe: {"assets_ids": ["token_id1"], "type": "market"}
+
+Events: book, price_change, last_trade_price
 ```
 
-### RTDS WebSocket (Chainlink prices)
+## User Channel (L2 Required)
+
 ```
-URL: wss://ws-live-data.polymarket.com
+wss://ws-subscriptions-clob.polymarket.com/ws/user
+
+Events: order updates, trade confirmations
+```
+
+## RTDS (Chainlink)
+
+```
+wss://ws-live-data.polymarket.com
 Events: crypto_prices_chainlink
 ```
 
-### Polygon RPC (on-chain events)
-```
-wss://polygon-bor-rpc.publicnode.com
-wss://polygon.drpc.org
+---
 
-Subscribe via eth_subscribe to OrderFilled logs
-Latency: ~2-5s (vs ~10-30s from data-api)
+# Local Modules
+
+## subgraph.py
+
+On-chain trades (source of truth).
+
+```python
+from subgraph import get_wallet_trades, decode_trade, count_wallet_trades
+
+trades = get_wallet_trades(wallet, limit=100, role='both', since_ts=None)
+decoded = decode_trade(raw_event, wallet)
+counts = count_wallet_trades(wallet)
+all_trades = get_wallet_trades_all(wallet)
+```
+
+## data_api.py
+
+Enriched trades with metadata.
+
+```python
+from data_api import get_trades, get_wallet_trades, summarize_trades
+
+trades = get_trades(limit=100)
+trades = get_wallet_trades(wallet, limit=100)
+summary = summarize_trades(trades)
+```
+
+## gamma.py
+
+Market metadata and token mapping.
+
+```python
+from gamma import get_market_by_token, get_token_info, find_markets
+
+market = get_market_by_token(token_id)
+info = get_token_info(token_id)
+markets = find_markets(slug_contains='updown', active=True)
+```
+
+## clob.py
+
+Orderbook and pricing.
+
+```python
+from clob import get_book, get_price, get_spread, get_spreads_batch
+
+book = get_book(token_id)
+price = get_price(token_id, side='buy')
+spread = get_spread(token_id)
+spreads = get_spreads_batch([token_id1, token_id2])
+edge = get_combined_spread(up_token, down_token)
+est = estimate_fill(token_id, 'buy', 100)
+```
+
+## markets.py
+
+Market discovery and search.
+
+```python
+from markets import search_markets, get_trending, get_market_details, public_search
+
+results = public_search('bitcoin')  # official search API
+trending = get_trending(limit=20)
+market = get_market_details(slug='bitcoin-100k')
+windows = get_current_15m_window()
+```
+
+## wallet.py
+
+Wallet analysis.
+
+```python
+from wallet import analyze_wallet, get_positions, get_pnl
+
+analysis = analyze_wallet(wallet)
+positions = get_positions(wallet)
+pnl = get_pnl(wallet)
 ```
 
 ---
 
-## Common Patterns
-
-### Get all trades for a wallet with market info
-
-```python
-from wallet import get_decoded_trades
-
-trades = get_decoded_trades('0x6031...', limit=500)
-for t in trades:
-    print(f"{t['side']} {t['shares']:.2f} {t['outcome']} @ ${t['price']:.4f}")
-    print(f"  Market: {t['market']}")
-```
-
-### Calculate book edge for 15m market
-
-```python
-from gamma import get_market_by_slug
-from clob import get_combined_spread
-import json
-
-market = get_market_by_slug('btc-updown-15m-1765344600')
-tokens = json.loads(market['clobTokenIds'])
-
-edge = get_combined_spread(tokens[0], tokens[1])
-print(f"Book edge: {edge['edge_pct']}%")
-```
-
-### Monitor wallet in real-time
-
-```python
-import time
-from subgraph import get_wallet_trades
-
-wallet = '0x6031...'
-last_ts = int(time.time())
-
-while True:
-    trades = get_wallet_trades(wallet, limit=10, since_ts=last_ts)
-    for t in trades:
-        print(f"New trade: {t['transactionHash']}")
-    if trades:
-        last_ts = int(trades[0]['timestamp'])
-    time.sleep(5)
-```
-
----
-
-## Rate Limits & Pagination
-
-| API | Limit | Pagination |
-|-----|-------|------------|
-| Goldsky Subgraph | 1000/query | `skip` param |
-| Data API | 500/query | `offset` or `before` param |
-| CLOB markets | 1000/query | cursor-based |
-| Gamma API | varies | `limit` param |
-
----
-
-## Quick Reference
+# CLI Quick Reference
 
 ```bash
 # market discovery
 python markets.py trending --limit 10
-python markets.py search "bitcoin" --limit 5
+python markets.py search "bitcoin"
 python markets.py 15m
-python markets.py details fed-rate-hike-in-2025
 
 # wallet analysis
-python wallet.py analyze 0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d
+python wallet.py analyze 0x6031...
 python wallet.py positions 0x6031...
-python wallet.py pnl 0x6031...
-
-# trades (source of truth)
-python subgraph.py trades 0x6031... --limit 50
-python subgraph.py count 0x6031...
-
-# enriched trades with market names
-python data_api.py wallet 0x6031... --limit 50
-python data_api.py recent --limit 20
-
-# token → market mapping
-python gamma.py token 61923092...
-python gamma.py slug btc-updown-15m-1765344600
 
 # orderbook
-python clob.py book 61923092...
-python clob.py spread 61923092...
-python clob.py depth 61923092... --levels 10
+python clob.py book <token_id>
+python clob.py spread <token_id>
+
+# trades
+python subgraph.py trades 0x6031... --limit 50
+python data_api.py wallet 0x6031...
+
+# token lookup
+python gamma.py token <token_id>
 ```
+
+---
+
+# Known Wallets
+
+| Name | Address |
+|------|---------|
+| Gabagool | `0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d` |
+| Sharky | `0x751a2b86cab503496efd325c8344e10159349ea1` |
+
+---
+
+# Rate Limits
+
+| API | Limit | Pagination |
+|-----|-------|------------|
+| Subgraph | 1000/query | `skip` |
+| Data API | 500/query | `offset` / `before` |
+| CLOB | 1000/query | cursor |
+| Gamma | varies | `limit` / `offset` |

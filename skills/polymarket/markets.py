@@ -40,6 +40,29 @@ DATA_API = "https://data-api.polymarket.com"
 # MARKET DISCOVERY
 # =============================================================================
 
+def public_search(query: str, limit_per_type: int = 10, events_status: str = None,
+                  search_profiles: bool = False) -> dict:
+    """
+    official polymarket search API
+
+    args:
+        query: search text
+        limit_per_type: max results per type (events, tags, profiles)
+        events_status: filter by status
+        search_profiles: include profile results
+
+    returns dict with: events, tags, profiles, pagination
+    """
+    params = {'q': query, 'limit_per_type': limit_per_type}
+    if events_status:
+        params['events_status'] = events_status
+    if search_profiles:
+        params['search_profiles'] = 'true'
+
+    resp = requests.get(f"{GAMMA_API}/public-search", params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
 def get_trending(limit: int = 20, timeframe: str = '24hr') -> list:
     """
     get top markets by volume
@@ -68,6 +91,52 @@ def get_active_markets(limit: int = 50, offset: int = 0) -> list:
         'limit': limit,
         'offset': offset
     }, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def list_markets(limit: int = 100, offset: int = 0, order: str = 'volume24hr',
+                 ascending: bool = False, active: bool = None, closed: bool = None,
+                 slug: list = None, condition_ids: list = None, clob_token_ids: list = None,
+                 tag_id: int = None, volume_min: float = None, liquidity_min: float = None) -> list:
+    """
+    list markets with full query options
+
+    args:
+        limit: max results
+        offset: pagination offset
+        order: sort field (volume24hr, volume, liquidity, etc)
+        ascending: sort direction
+        active: filter by active status
+        closed: filter by closed status
+        slug: filter by slugs
+        condition_ids: filter by condition IDs
+        clob_token_ids: filter by token IDs
+        tag_id: filter by category/tag
+        volume_min: minimum volume filter
+        liquidity_min: minimum liquidity filter
+
+    returns list of markets
+    """
+    params = {'limit': limit, 'offset': offset, 'order': order, 'ascending': str(ascending).lower()}
+
+    if active is not None:
+        params['active'] = str(active).lower()
+    if closed is not None:
+        params['closed'] = str(closed).lower()
+    if slug:
+        params['slug'] = slug
+    if condition_ids:
+        params['condition_ids'] = condition_ids
+    if clob_token_ids:
+        params['clob_token_ids'] = clob_token_ids
+    if tag_id:
+        params['tag_id'] = tag_id
+    if volume_min:
+        params['volume_num_min'] = volume_min
+    if liquidity_min:
+        params['liquidity_num_min'] = liquidity_min
+
+    resp = requests.get(f"{GAMMA_API}/markets", params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
