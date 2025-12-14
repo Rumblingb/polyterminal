@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-Paper Trader - queue-based fill simulation using websocket book events
-Posts at best_bid (back of queue), only fills when large SELLs sweep through
+Paper Trader - multi-level grid strategy
 
-CRITICAL ASSUMPTIONS (read before going live):
-1. PnL only counts MATCHED fills - unmatched positions are 50/50 gambles
-2. We assume back-of-queue position (conservative)
-3. NO trading fees included - Polymarket charges ~0.5-2% depending on role
-4. Fill at our bid price, not the trade price (maker model)
-5. Queue depth from book snapshots may be stale
-6. Real latency for order placement not simulated
-7. CAPTURE_RATE models competition - we only get fraction of overflow
-   (based on backtest_passive.py analysis: 10-20% is realistic)
+Posts at fixed price levels: 0.44, 0.46, 0.48
+Small orders (~$5 each) per level
+Edges: 12%, 8%, 4% respectively
 
-RISKS FOR LIVE TRADING:
-- Unmatched exposure is gambling, not guaranteed profit
-- Queue position in reality depends on when you placed order
-- Book can move against you between signal and order placement
-- Network issues can cause missed fills or duplicate orders
+From backtest (mm_backtest_realistic.py):
+- Queue 0% ahead: $188/day expected
+- Queue 75% ahead: $142/day expected
+- Unmatched fills have positive EV (buying below 0.50)
 """
 
 import asyncio
@@ -44,15 +36,11 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 COINS = ['btc']
 
-# realistic params
-CAPITAL_PER_SIDE = 50  # $50 bid on each side per coin
-MIN_ORDER_SIZE = 5  # minimum $5 per order like gabagool
-MAX_IMBALANCE_RATIO = 3.0  # max imbalance: don't let one side exceed 3x the other
-# e.g., if we have 100 UP shares, don't accumulate more than 300 DOWN shares
-
-# capture rate: what fraction of overflow we actually get
-# based on backtest analysis, 10-20% is realistic given competition
-CAPTURE_RATE = 0.15  # 15% of available flow
+# multi-level grid params
+PRICE_LEVELS = [0.44, 0.46, 0.48]
+CAPITAL_PER_SIDE = 150  # $150 per side
+ORDER_SIZE = int(CAPITAL_PER_SIDE / len(PRICE_LEVELS) / 0.46)  # ~36 shares per level
+CAPTURE_RATE = 0.15  # 15% of overflow
 
 
 @dataclass
@@ -60,136 +48,86 @@ class CoinBook:
     coin: str
     up_token: str = ''
     down_token: str = ''
-    capital_up: float = CAPITAL_PER_SIDE
-    capital_down: float = CAPITAL_PER_SIDE
-    up_bid: float = 0
-    up_ask: float = 1
-    down_bid: float = 0
-    down_ask: float = 1
-    # queue depth at best bid (from websocket book events)
-    up_queue: float = 0
-    down_queue: float = 0
-    up_queue_samples: list = field(default_factory=list)
-    down_queue_samples: list = field(default_factory=list)
-    # our simulated fills
-    up_fills: list = field(default_factory=list)
-    down_fills: list = field(default_factory=list)
-    # market totals (for comparison)
+    # fills[side][price] = qty
+    fills: dict = field(default_factory=lambda: {
+        'up': {p: 0.0 for p in PRICE_LEVELS},
+        'down': {p: 0.0 for p in PRICE_LEVELS}
+    })
+    # queue depth at each level from book snapshots
+    queue: dict = field(default_factory=lambda: {
+        'up': {p: 3000.0 for p in PRICE_LEVELS},
+        'down': {p: 3000.0 for p in PRICE_LEVELS}
+    })
+    # market totals
     market_up_sells: float = 0
     market_down_sells: float = 0
     trade_count: int = 0
-    edge_samples: list = field(default_factory=list)
-    # latency tracking (ms)
     latency_samples: list = field(default_factory=list)
 
-    @property
-    def combined_bid(self):
-        return self.up_bid + self.down_bid
+    def total_filled(self, side: str) -> float:
+        return sum(self.fills[side].values())
 
-    @property
-    def edge(self):
-        return 1.0 - self.combined_bid if self.combined_bid < 1 else 0
+    def matched_at_level(self, price: float) -> float:
+        return min(self.fills['up'][price], self.fills['down'][price])
 
-    def try_fill(self, side: str, trade_price: float, size: float) -> float:
-        """try to fill from a market SELL using queue-based model
+    def total_matched(self) -> float:
+        return sum(self.matched_at_level(p) for p in PRICE_LEVELS)
 
-        we post at best_bid, so we fill at OUR bid price, not the trade price
-        trade just needs to sweep through our level
-        """
-        # skip if no edge
-        if self.combined_bid >= 1.0:
-            return 0
+    def try_fill(self, side: str, trade_price: float, size: float) -> tuple:
+        """try to fill at each price level"""
+        filled_at = []
 
-        # calculate current fill totals
-        up_shares = sum(s for _, s in self.up_fills)
-        down_shares = sum(s for _, s in self.down_fills)
+        for level in PRICE_LEVELS:
+            # trade must reach our level
+            if trade_price > level + 0.01:
+                continue
 
-        if side == 'up':
-            our_bid = self.up_bid
-            if self.capital_up < MIN_ORDER_SIZE or our_bid <= 0:
-                return 0
-            # check imbalance limit - don't let one side get too far ahead
-            if down_shares > 0 and up_shares >= down_shares * MAX_IMBALANCE_RATIO:
-                return 0  # UP side too far ahead, skip fill
-            # trade must be at or below our bid to reach us
-            if trade_price > our_bid + 0.02:
-                return 0
-            # queue-based: only fill fraction of overflow beyond queue depth
-            # apply capture rate to simulate competition from other MMs
-            if size <= self.up_queue:
-                return 0
-            overflow = size - self.up_queue
-            available = overflow * CAPTURE_RATE  # we only get a fraction
-            max_shares = self.capital_up / our_bid
-            fill_size = min(available, max_shares)
-            if fill_size > 0:
-                cost = fill_size * our_bid  # fill at OUR bid, not trade price
-                self.capital_up -= cost
-                self.up_fills.append((our_bid, fill_size))
-            return fill_size
-        else:
-            our_bid = self.down_bid
-            if self.capital_down < MIN_ORDER_SIZE or our_bid <= 0:
-                return 0
-            # check imbalance limit
-            if up_shares > 0 and down_shares >= up_shares * MAX_IMBALANCE_RATIO:
-                return 0  # DOWN side too far ahead, skip fill
-            if trade_price > our_bid + 0.02:
-                return 0
-            # queue-based: only fill fraction of overflow
-            if size <= self.down_queue:
-                return 0
-            overflow = size - self.down_queue
-            available = overflow * CAPTURE_RATE  # we only get a fraction
-            max_shares = self.capital_down / our_bid
-            fill_size = min(available, max_shares)
-            if fill_size > 0:
-                cost = fill_size * our_bid  # fill at OUR bid, not trade price
-                self.capital_down -= cost
-                self.down_fills.append((our_bid, fill_size))
-            return fill_size
+            remaining = ORDER_SIZE - self.fills[side][level]
+            if remaining <= 0:
+                continue
+
+            # queue-based fill
+            queue = self.queue[side][level]
+            if size <= queue:
+                continue
+
+            overflow = size - queue
+            available = overflow * CAPTURE_RATE
+            fill = min(available, remaining)
+
+            if fill > 0:
+                self.fills[side][level] += fill
+                filled_at.append((level, fill))
+
+        return filled_at
 
     def add_market_sell(self, side: str, size: float):
-        """track total market SELL volume"""
         if side == 'up':
             self.market_up_sells += size
         else:
             self.market_down_sells += size
 
-    def sample_edge(self):
-        if self.combined_bid > 0:
-            self.edge_samples.append(self.edge)
+    def update_queue(self, side: str, bids: list):
+        """update queue depth from book snapshot"""
+        for level in PRICE_LEVELS:
+            depth = sum(float(b['size']) for b in bids if float(b['price']) >= level)
+            if depth > 0:
+                self.queue[side][level] = depth * 1.2  # safety margin
 
     def calc_pnl(self):
-        """calculate REALISTIC pnl - only matched fills count as guaranteed profit
+        """calculate pnl per level"""
+        total_pnl = 0
+        for p in PRICE_LEVELS:
+            matched = self.matched_at_level(p)
+            edge = 1 - p * 2
+            total_pnl += matched * edge
 
-        WARNING: unmatched fills are NOT profit - they're 50/50 gambles on the outcome.
-        we track them separately but do NOT include in pnl.
-        """
-        up_shares = sum(s for _, s in self.up_fills)
-        down_shares = sum(s for _, s in self.down_fills)
-        up_cost = sum(p * s for p, s in self.up_fills)
-        down_cost = sum(p * s for p, s in self.down_fills)
+        up_total = self.total_filled('up')
+        down_total = self.total_filled('down')
+        up_cost = sum(self.fills['up'][p] * p for p in PRICE_LEVELS)
+        down_cost = sum(self.fills['down'][p] * p for p in PRICE_LEVELS)
 
-        if up_shares == 0 or down_shares == 0:
-            return 0, up_shares, down_shares, 1.0, up_cost + down_cost
-
-        matched = min(up_shares, down_shares)
-        up_avg = up_cost / up_shares
-        down_avg = down_cost / down_shares
-        combined = up_avg + down_avg
-        edge = 1.0 - combined
-
-        # ONLY count matched fills as profit - this is guaranteed money
-        matched_pnl = matched * edge
-
-        # track unmatched exposure (for reporting only - NOT profit)
-        self.unmatched_up = max(0, up_shares - down_shares)
-        self.unmatched_down = max(0, down_shares - up_shares)
-        self.unmatched_exposure = self.unmatched_up * up_avg + self.unmatched_down * down_avg
-
-        capital_used = up_cost + down_cost
-        return matched_pnl, up_shares, down_shares, combined, capital_used
+        return total_pnl, up_total, down_total, up_cost + down_cost
 
 
 class PaperTrader:
@@ -201,8 +139,6 @@ class PaperTrader:
         self.session_capital = 0
         self.client = None
         self.fill_buffer = []
-        self.order_buffer = []
-        self.last_order_store = {}
 
     def connect_ch(self):
         if not CH_PASSWORD:
@@ -288,40 +224,6 @@ class PaperTrader:
             price * size
         ))
 
-    def store_order(self, window_ts: int, coin: str, side: str, price: float, size: float, now: float):
-        """store limit order we would post - sample every 5s or on price change"""
-        if not self.client:
-            return
-
-        key = f'{coin}_{side}'
-        last = self.last_order_store.get(key, (0, 0))
-        last_time, last_price = last
-
-        # only store every 5s or if price changed by >1%
-        if now - last_time < 5 and abs(price - last_price) / last_price < 0.01 if last_price > 0 else False:
-            return
-
-        self.last_order_store[key] = (now, price)
-        self.order_buffer.append((
-            datetime.utcnow(),
-            window_ts,
-            coin,
-            side,
-            price,
-            size,
-            price * size
-        ))
-
-    def flush_orders(self):
-        if not self.client or not self.order_buffer:
-            return
-        try:
-            self.client.insert('paper_orders', self.order_buffer,
-                column_names=['ts', 'window_ts', 'coin', 'side', 'price', 'size', 'cost'])
-            self.order_buffer.clear()
-        except Exception as e:
-            print(f'[ch] order flush error: {e}')
-
     def flush_fills(self):
         if not self.client or not self.fill_buffer:
             return
@@ -335,12 +237,10 @@ class PaperTrader:
     def store_window(self, window_ts: int, coin: str, book):
         if not self.client:
             return
-        up_shares = sum(s for _, s in book.up_fills)
-        down_shares = sum(s for _, s in book.down_fills)
-        up_cost = sum(p * s for p, s in book.up_fills)
-        down_cost = sum(p * s for p, s in book.down_fills)
-        avg_edge = sum(book.edge_samples) / len(book.edge_samples) if book.edge_samples else 0
-        pnl, _, _, _, _ = book.calc_pnl()
+        pnl, up_shares, down_shares, total_cost = book.calc_pnl()
+        up_cost = sum(book.fills['up'][p] * p for p in PRICE_LEVELS)
+        down_cost = sum(book.fills['down'][p] * p for p in PRICE_LEVELS)
+        avg_edge = (1 - (up_cost + down_cost) / (up_shares + down_shares)) if (up_shares + down_shares) > 0 else 0
 
         try:
             self.client.insert('paper_windows', [(
@@ -418,7 +318,6 @@ class PaperTrader:
         if not self.tokens:
             return
 
-        self.last_order_store.clear()
         fills_log = []
 
         try:
@@ -446,8 +345,7 @@ class PaperTrader:
                         event_ts = data.get('timestamp')
                         if event_ts:
                             latency_ms = (now * 1000) - int(event_ts)
-                            # get coin for this event
-                            aid = data.get('asset_id') or (data.get('price_changes', [{}])[0].get('asset_id') if data.get('price_changes') else None)
+                            aid = data.get('asset_id')
                             if aid:
                                 info = self.tokens.get(aid)
                                 if info:
@@ -456,9 +354,6 @@ class PaperTrader:
                                         book.latency_samples.append(latency_ms)
 
                         if event_type == 'book':
-                            # update queue depth from book snapshot
-                            # NOTE: this only captures size at best bid, not total queue
-                            # real queue could be larger if multiple orders at same price
                             asset_id = data.get('asset_id')
                             info = self.tokens.get(asset_id)
                             if info:
@@ -467,45 +362,7 @@ class PaperTrader:
                                 if book:
                                     bids = data.get('bids', [])
                                     if bids:
-                                        best = max(bids, key=lambda x: float(x['price']))
-                                        depth = float(best['size'])
-                                        # add 20% safety margin - queue is likely larger than snapshot
-                                        depth = depth * 1.2
-                                        if side == 'up':
-                                            book.up_queue = depth
-                                            book.up_queue_samples.append(depth)
-                                        else:
-                                            book.down_queue = depth
-                                            book.down_queue_samples.append(depth)
-
-                        elif event_type == 'price_change':
-                            for pc in data.get('price_changes', []):
-                                info = self.tokens.get(pc.get('asset_id'))
-                                if not info:
-                                    continue
-                                coin, side = info
-                                book = self.books.get(coin)
-                                if not book:
-                                    continue
-
-                                bid = float(pc.get('best_bid', 0))
-                                ask = float(pc.get('best_ask', 1))
-
-                                if side == 'up':
-                                    book.up_bid = bid
-                                    book.up_ask = ask
-                                    capital = book.capital_up
-                                else:
-                                    book.down_bid = bid
-                                    book.down_ask = ask
-                                    capital = book.capital_down
-
-                                book.sample_edge()
-
-                                # store limit order we'd post (only during accumulate, with edge)
-                                if now < accumulate_end and capital >= MIN_ORDER_SIZE and book.edge > 0 and bid > 0:
-                                    order_size = capital / bid
-                                    self.store_order(window_ts, coin, side, bid, order_size, now)
+                                        book.update_queue(side, bids)
 
                         elif event_type == 'last_trade_price':
                             info = self.tokens.get(data.get('asset_id'))
@@ -523,15 +380,14 @@ class PaperTrader:
 
                             book.trade_count += 1
 
-                            # only try to fill on SELL trades in first 9 min
                             if trade_side == 'SELL':
                                 book.add_market_sell(side, size)
 
                                 if now < accumulate_end:
-                                    fill = book.try_fill(side, price, size)
-                                    if fill > 0:
-                                        fills_log.append(f'{elapsed:.0f}s {coin}/{side} {fill:.1f}@${price:.2f}')
-                                        self.store_fill(window_ts, coin, side, price, fill)
+                                    filled_at = book.try_fill(side, price, size)
+                                    for level, fill in filled_at:
+                                        fills_log.append(f'{elapsed:.0f}s {side}@{level} x{fill:.0f}')
+                                        self.store_fill(window_ts, coin, side, level, fill)
 
                     except:
                         pass
@@ -543,51 +399,39 @@ class PaperTrader:
         total_pnl = 0
         total_capital = 0
         lines = [f'<b>Window {dt.strftime("%H:%M")} UTC</b>']
-        lines.append(f'<i>Capital: ${CAPITAL_PER_SIDE}/side, queue-based fills</i>\n')
+        levels_str = '/'.join([str(p) for p in PRICE_LEVELS])
+        lines.append(f'<i>Grid: {levels_str} x {ORDER_SIZE}</i>\n')
 
         for coin, book in sorted(self.books.items()):
-            pnl, up_shares, down_shares, combined, capital = book.calc_pnl()
+            pnl, up_shares, down_shares, capital = book.calc_pnl()
             total_pnl += pnl
             total_capital += capital
-
-            avg_edge = sum(book.edge_samples) / len(book.edge_samples) * 100 if book.edge_samples else 0
-            market_sells = book.market_up_sells + book.market_down_sells
-            our_fills = up_shares + down_shares
-            capture_rate = (our_fills / market_sells * 100) if market_sells > 0 else 0
-
-            # avg queue depth
-            avg_up_q = sum(book.up_queue_samples) / len(book.up_queue_samples) if book.up_queue_samples else 0
-            avg_down_q = sum(book.down_queue_samples) / len(book.down_queue_samples) if book.down_queue_samples else 0
 
             # latency stats
             lat = book.latency_samples
             avg_lat = sum(lat) / len(lat) if lat else 0
-            p50_lat = sorted(lat)[len(lat)//2] if lat else 0
-            p99_lat = sorted(lat)[int(len(lat)*0.99)] if lat else 0
 
             if up_shares == 0 and down_shares == 0:
-                lines.append(f'<b>{coin.upper()}</b>: no fills (queue ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | lat {avg_lat:.0f}ms)')
+                lines.append(f'<b>{coin.upper()}</b>: no fills (lat {avg_lat:.0f}ms)')
                 continue
 
-            matched = min(up_shares, down_shares)
+            matched = book.total_matched()
+
+            # breakdown by level
+            level_details = []
+            for p in PRICE_LEVELS:
+                m = book.matched_at_level(p)
+                if m > 0:
+                    level_details.append(f'{p}:{m:.0f}')
+
             emoji = '+' if pnl > 0 else '-' if pnl < 0 else '='
             lines.append(
                 f'{emoji} <b>{coin.upper()}</b>: '
                 f'↑{up_shares:.0f} ↓{down_shares:.0f} (matched: {matched:.0f}) | '
-                f'edge {avg_edge:+.1f}% | '
                 f'<b>${pnl:+.2f}</b>'
             )
-            # warn about unmatched exposure
-            unmatched = abs(up_shares - down_shares)
-            if unmatched > 0:
-                exposure = getattr(book, 'unmatched_exposure', 0)
-                lines.append(
-                    f'   ⚠️ UNMATCHED: {unmatched:.0f} shares (${exposure:.0f} at risk - 50/50 gamble)'
-                )
-            lines.append(
-                f'   queue: ↑{avg_up_q:.0f} ↓{avg_down_q:.0f} | '
-                f'lat: {p50_lat:.0f}ms p50 / {p99_lat:.0f}ms p99'
-            )
+            if level_details:
+                lines.append(f'   levels: {" ".join(level_details)}')
 
         self.session_pnl += total_pnl
         self.session_capital += total_capital
@@ -595,16 +439,11 @@ class PaperTrader:
 
         # store to clickhouse
         self.flush_fills()
-        self.flush_orders()
         for coin, book in self.books.items():
             self.store_window(window_ts, coin, book)
 
-        # summary - MATCHED ONLY (guaranteed profit)
-        roi = (total_pnl / total_capital * 100) if total_capital > 0 else 0
-        session_roi = (self.session_pnl / self.session_capital * 100) if self.session_capital > 0 else 0
-
-        lines.append(f'\n<b>Window PnL (matched only):</b> ${total_pnl:+.2f}')
-        lines.append(f'<b>Session PnL (matched only):</b> ${self.session_pnl:+.2f}')
+        lines.append(f'\n<b>Window PnL:</b> ${total_pnl:+.2f}')
+        lines.append(f'<b>Session PnL:</b> ${self.session_pnl:+.2f}')
         lines.append(f'<b>Windows:</b> {len(self.results)}')
 
         msg = '\n'.join(lines)
@@ -616,24 +455,24 @@ class PaperTrader:
             all_lat.extend(book.latency_samples)
         avg_lat = sum(all_lat) / len(all_lat) if all_lat else 0
 
-        print(f'[paper] pnl=${total_pnl:+.2f} roi={roi:+.1f}% lat={avg_lat:.0f}ms')
+        print(f'[paper] pnl=${total_pnl:+.2f} lat={avg_lat:.0f}ms')
 
     async def run(self):
         print('=' * 60)
-        print('PAPER TRADER (queue-based fills)')
-        print(f'Capital: ${CAPITAL_PER_SIDE} per side per coin')
+        print('PAPER TRADER - Multi-level Grid')
+        print(f'Levels: {PRICE_LEVELS} (edges: {[f"{(1-p*2)*100:.0f}%" for p in PRICE_LEVELS]})')
+        print(f'Size: {ORDER_SIZE} shares per level')
         print(f'Capture rate: {CAPTURE_RATE*100:.0f}% of overflow')
         print(f'Coins: {COINS}')
         print('=' * 60)
 
         self.connect_ch()
 
+        levels_str = '/'.join([str(p) for p in PRICE_LEVELS])
         startup_msg = (
             f'<b>Paper Trader Started</b>\n'
-            f'Capital: ${CAPITAL_PER_SIDE}/side/coin\n'
-            f'Model: queue-based (back of queue)\n'
-            f'Capture rate: {CAPTURE_RATE*100:.0f}% of overflow\n'
-            f'PnL: MATCHED ONLY (realistic)\n'
+            f'Grid: {levels_str} x {ORDER_SIZE}\n'
+            f'Capture rate: {CAPTURE_RATE*100:.0f}%\n'
             f'Coins: {", ".join(c.upper() for c in COINS)}'
         )
         await self.send_telegram(startup_msg)

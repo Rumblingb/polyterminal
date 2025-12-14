@@ -13,6 +13,9 @@ import aiohttp
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
+# our price levels
+PRICE_LEVELS = [0.44, 0.46, 0.48]
+
 
 @dataclass
 class CoinStats:
@@ -81,12 +84,15 @@ class CoinStats:
             self.down_trades += 1
             self.down_volume += vol
 
-        # only track SELL trades as fills (someone selling into our bid)
+        # only track SELL trades at our price levels
         if trade_side == 'SELL':
-            if side == 'up':
-                self.up_fills.append((price, size))
-            else:
-                self.down_fills.append((price, size))
+            for level in PRICE_LEVELS:
+                if price <= level + 0.01:
+                    if side == 'up':
+                        self.up_fills.append((level, size))  # record at our level, not trade price
+                    else:
+                        self.down_fills.append((level, size))
+                    break  # only count once at lowest matching level
 
 
 class WindowAlerts:
@@ -136,15 +142,13 @@ class WindowAlerts:
             total_trades += stats.total_trades
             all_arbs.extend([(coin, *arb) for arb in stats.arb_ops])
 
-            # accumulate pnl
-            up_shares = sum(s for _, s in stats.up_fills)
-            down_shares = sum(s for _, s in stats.down_fills)
-            if up_shares > 0 and down_shares > 0:
-                matched = min(up_shares, down_shares)
-                up_cost = sum(p * s for p, s in stats.up_fills)
-                down_cost = sum(p * s for p, s in stats.down_fills)
-                fill_edge = 1 - (up_cost / up_shares + down_cost / down_shares)
-                total_pnl += matched * fill_edge
+            # accumulate pnl per level
+            for level in PRICE_LEVELS:
+                up_at_level = sum(s for p, s in stats.up_fills if p == level)
+                down_at_level = sum(s for p, s in stats.down_fills if p == level)
+                matched = min(up_at_level, down_at_level)
+                edge = 1 - level * 2
+                total_pnl += matched * edge
 
             if stats.total_trades == 0:
                 lines.append(f'<b>{coin.upper()}</b>: no activity')
@@ -155,26 +159,28 @@ class WindowAlerts:
             min_edge = min(stats.edge_samples) * 100 if stats.edge_samples else 0
             max_edge = max(stats.edge_samples) * 100 if stats.edge_samples else 0
 
-            # calc pnl from fills
+            # calc pnl per level
             up_shares = sum(s for _, s in stats.up_fills)
             down_shares = sum(s for _, s in stats.down_fills)
-            up_cost = sum(p * s for p, s in stats.up_fills)
-            down_cost = sum(p * s for p, s in stats.down_fills)
 
             pnl = 0
-            if up_shares > 0 and down_shares > 0:
-                matched = min(up_shares, down_shares)
-                up_avg = up_cost / up_shares
-                down_avg = down_cost / down_shares
-                combined_fill = up_avg + down_avg
-                fill_edge = 1 - combined_fill
-                pnl = matched * fill_edge
+            level_details = []
+            for level in PRICE_LEVELS:
+                up_at = sum(s for p, s in stats.up_fills if p == level)
+                down_at = sum(s for p, s in stats.down_fills if p == level)
+                matched = min(up_at, down_at)
+                if matched > 0:
+                    edge = 1 - level * 2
+                    pnl += matched * edge
+                    level_details.append(f'{level}:{matched:.0f}')
 
             lines.append(f'<b>{coin.upper()}</b>')
             lines.append(f'  trades: {stats.up_trades} up / {stats.down_trades} dn')
             lines.append(f'  volume: ${stats.up_volume:.0f} up / ${stats.down_volume:.0f} dn')
             if up_shares > 0 or down_shares > 0:
                 lines.append(f'  fills: {up_shares:.0f} up / {down_shares:.0f} dn | <b>${pnl:+.2f}</b>')
+                if level_details:
+                    lines.append(f'  levels: {" ".join(level_details)}')
             lines.append(f'  book edge: {avg_edge:+.1f}% avg ({min_edge:+.1f} to {max_edge:+.1f})')
             lines.append('')
 
